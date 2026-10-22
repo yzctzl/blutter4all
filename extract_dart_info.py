@@ -10,9 +10,12 @@ from struct import unpack
 from elftools.elf.elffile import ELFFile
 from elftools.elf.enums import ENUM_E_MACHINE 
 from elftools.elf.sections import SymbolTableSection
+from macho import MachO, is_macho
 
-# TODO: support both ELF and Mach-O file
 def extract_snapshot_hash_flags(libapp_file):
+    if is_macho(libapp_file):
+        snapshot_hash, flags, _ = MachO(libapp_file).snapshot_info()
+        return snapshot_hash, flags
     with open(libapp_file, 'rb') as f:
         elf = ELFFile(f)
         # find "_kDartVmSnapshotData" symbol
@@ -20,7 +23,12 @@ def extract_snapshot_hash_flags(libapp_file):
         sym = dynsym.get_symbol_by_name('_kDartVmSnapshotData')[0]
         #section = elf.get_section(sym['st_shndx'])
         assert sym['st_size'] > 128
-        f.seek(sym['st_value']+20)
+        address = sym['st_value']
+        segment = next((s for s in elf.iter_segments() if s['p_type'] == 'PT_LOAD' and
+                        s['p_vaddr'] <= address and address - s['p_vaddr'] + 52 <= s['p_filesz']), None)
+        if segment is None:
+            raise ValueError('ELF snapshot metadata is not file backed')
+        f.seek(segment['p_offset'] + address - segment['p_vaddr'] + 20)
         snapshot_hash = f.read(32).decode()
         data = f.read(256) # should be enough
         flags = data[:data.index(b'\0')].decode().strip().split(' ')
@@ -28,6 +36,14 @@ def extract_snapshot_hash_flags(libapp_file):
     return snapshot_hash, flags
 
 def extract_libflutter_info(libflutter_file):
+    if is_macho(libflutter_file):
+        image = MachO(libflutter_file)
+        data = image.data.tobytes()
+        versions = {match[0].decode() for match in re.findall(br'\x00([\d\w\.-]+) \((stable|beta|dev)\)', data)}
+        if len(versions) > 1:
+            raise ValueError('Ambiguous Dart versions in selected Flutter engine slice')
+        hashes = re.findall(br'\x00([a-f\d]{40})(?=\x00)', data)
+        return [value.decode() for value in hashes], next(iter(versions), None), 'arm64', image.platform
     with open(libflutter_file, 'rb') as f:
         elf = ELFFile(f)
         if elf.header.e_machine == 'EM_AARCH64': # 183
@@ -102,16 +118,28 @@ def get_dart_commit(url):
     return commit_id, dart_version
 
 def extract_dart_info(libapp_file: str, libflutter_file: str):
-    snapshot_hash, flags = extract_snapshot_hash_flags(libapp_file)
+    apple = is_macho(libapp_file)
+    if apple != is_macho(libflutter_file):
+        raise ValueError('App and Flutter engine formats do not match')
+    if apple:
+        snapshot_hash, flags, snapshot_os = MachO(libapp_file).snapshot_info()
+    else:
+        snapshot_hash, flags = extract_snapshot_hash_flags(libapp_file)
     #print('snapshot hash', snapshot_hash)
     #print(flags)
 
     engine_ids, dart_version, arch, os_name = extract_libflutter_info(libflutter_file)
+    if apple:
+        if os_name not in (None, snapshot_os):
+            raise ValueError('App and Flutter engine target platforms do not match')
+        os_name = snapshot_os
     # print('possible engine ids', engine_ids)
     # print('dart version', dart_version)
 
     if dart_version is None:
         engine_id, sdk_url, sdk_size = get_dart_sdk_url_size(engine_ids)
+        if sdk_url is None:
+            raise ValueError('Cannot determine Dart SDK version from Flutter engine')
         # print(engine_id)
         # print(sdk_url)
         # print(sdk_size)

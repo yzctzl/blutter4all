@@ -41,10 +41,12 @@ class DartLibInfo:
         if has_compressed_ptrs is None:
             # use same as flutter default configuration
             # TODO: old Dart version has no pointer compression
-            self.has_compressed_ptrs = os_name != 'ios'
+            self.has_compressed_ptrs = os_name not in ('ios', 'macos')
         else:
             self.has_compressed_ptrs = has_compressed_ptrs
         self.lib_name = f'dartvm{version}_{os_name}_{arch}'
+        if not self.has_compressed_ptrs:
+            self.lib_name += '_no-compressed-ptrs'
 
 
 def checkout_dart(info: DartLibInfo):
@@ -149,15 +151,14 @@ def cmake_dart(info: DartLibInfo, target_dir: str):
     # cmake -GNinja -Bout3.0.3 -DCMAKE_BUILD_TYPE=Release
     #   add -DTARGET_ARCH=x64 for analyzing x64 libapp.so
     #   add -DTARGET_OS=ios for analyzing ios App
-    # Note: pointer compression feature is set from Flutter and no one change it when building app.
-    #       so only one build of Dart runtime is enough
+    # Pointer compression affects snapshot layout and is part of the library key.
     builddir = os.path.join(BUILD_DIR, info.lib_name)
     subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DTARGET_OS={info.os_name}', f'-DTARGET_ARCH={info.arch}', 
         f'-DCOMPRESSED_PTRS={1 if info.has_compressed_ptrs else 0}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'], 
         cwd=target_dir, check=True)
     
     # build and install dart vm library to packages directory
-    subprocess.run([NINJA_CMD], cwd=builddir, check=True)
+    subprocess.run([CMAKE_CMD, '--build', builddir], check=True)
     subprocess.run([CMAKE_CMD, '--install', '.'], cwd=builddir, check=True)
 
 def fetch_and_build(info: DartLibInfo):

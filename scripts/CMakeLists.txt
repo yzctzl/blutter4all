@@ -26,8 +26,8 @@ string(SUBSTRING ${PROJECT_NAME} 6 -1 DART_VERSION)
 if (NOT DEFINED TARGET_OS)
 	set(TARGET_OS "android")
 endif()
-if (NOT "${TARGET_OS}" MATCHES "^(android|ios)$")
-	message(FATAL_ERROR "Only android or ios platform")
+if (NOT "${TARGET_OS}" MATCHES "^(android|ios|macos)$")
+	message(FATAL_ERROR "Only android, ios or macos platform")
 endif()
 
 if (NOT DEFINED TARGET_ARCH)
@@ -39,6 +39,9 @@ endif()
 
 set(SRCDIR "runtime")
 set(LIBNAME "dartvm${DART_VERSION}_${TARGET_OS}_${TARGET_ARCH}")
+if (NOT COMPRESSED_PTRS)
+	string(APPEND LIBNAME "_no-compressed-ptrs")
+endif()
 
 set(CMAKE_DEBUG_POSTFIX "_d")
 
@@ -59,8 +62,10 @@ if (${TARGET_OS} STREQUAL "android")
 	set(target_os "DART_TARGET_OS_ANDROID")
 	# Note: DART_COMPRESSED_POINTERS should be from the binary
 	#set(dart_pointers "DART_COMPRESSED_POINTERS")
+elseif (${TARGET_OS} STREQUAL "ios")
+	set(target_os "DART_TARGET_OS_MACOS;DART_TARGET_OS_MACOS_IOS")
 else()
-	set(target_os "DART_TARGET_OS_MACOS_IOS")
+	set(target_os "DART_TARGET_OS_MACOS")
 endif()
 # TARGET_ARCH_ARM64 or TARGET_ARCH_X64
 if (${TARGET_ARCH} STREQUAL "arm64")

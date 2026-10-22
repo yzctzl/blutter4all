@@ -9,6 +9,7 @@ import subprocess
 import sys
 import zipfile
 import tempfile
+import stat
 from dartvm_fetch_build import DartLibInfo
 
 CMAKE_CMD = "cmake"
@@ -38,8 +39,6 @@ class BlutterInput:
 
         # Note: null-safety is detected in blutter application, so no need another build of blutter for null-safety
         self.name_suffix = ''
-        if not dart_info.has_compressed_ptrs:
-            self.name_suffix += '_no-compressed-ptrs'
         if no_analysis:
             self.name_suffix += '_no-analysis'
         # derive blutter executable filename
@@ -47,20 +46,51 @@ class BlutterInput:
         self.blutter_file = os.path.join(BIN_DIR, self.blutter_name) + ('.exe' if os.name == 'nt' else '')
 
 
+def framework_paths(name: str):
+    return [f'{name}.framework/{version}{name}' for version in ('', 'Versions/Current/', 'Versions/A/')]
+
+
 def find_lib_files(indir: str):
-    app_file = os.path.join(indir, 'libapp.so')
-    if not os.path.isfile(app_file):
-        app_file = os.path.join(indir, 'App')
-        if not os.path.isfile(app_file):
-            sys.exit("Cannot find libapp file")
-    
-    flutter_file = os.path.join(indir, 'libflutter.so')
-    if not os.path.isfile(flutter_file):
-        flutter_file = os.path.join(indir, 'Flutter')
-        if not os.path.isfile(flutter_file):
-            sys.exit("Cannot find libflutter file")
-    
-    return os.path.abspath(app_file), os.path.abspath(flutter_file)
+    android = tuple(os.path.abspath(os.path.join(indir, name)) for name in ('libapp.so', 'libflutter.so'))
+    if all(os.path.isfile(path) for path in android):
+        return android
+    for prefix in ('', 'Frameworks', 'Contents/Frameworks'):
+        def first(candidates):
+            return next((os.path.abspath(os.path.join(indir, prefix, path)) for path in candidates
+                         if os.path.isfile(os.path.join(indir, prefix, path))), None)
+        app = first(['App'] + framework_paths('App'))
+        engine = first(['Flutter', 'FlutterMacOS'] + framework_paths('Flutter') + framework_paths('FlutterMacOS'))
+        if app and engine:
+            return app, engine
+    raise ValueError('Cannot find a matching App and Flutter engine pair in ' + indir)
+
+
+def extract_libs_from_apple_archive(archive: str, out_dir: str):
+    # Copy only the selected pair to fixed paths: no archive paths are extracted.
+    with zipfile.ZipFile(archive) as zf:
+        names = {info.filename for info in zf.infolist()
+                 if not info.is_dir() and not stat.S_ISLNK(info.external_attr >> 16)}
+        roots = set()
+        for name in names:
+            for app in framework_paths('App'):
+                if name.endswith('/' + app):
+                    roots.add(name[:-len(app)])
+        pairs = []
+        for root in sorted(roots):
+            app = next((root + path for path in framework_paths('App') if root + path in names), None)
+            engine = next((root + path for target in ('Flutter', 'FlutterMacOS')
+                           for path in framework_paths(target) if root + path in names), None)
+            if app and engine:
+                pairs.append((app, engine))
+        if len(pairs) != 1:
+            raise ValueError('Expected exactly one Apple App/Flutter framework pair in archive')
+        paths = []
+        for source, filename in zip(pairs[0], ('App', 'Flutter')):
+            target = os.path.join(out_dir, filename)
+            with zf.open(source) as src, open(target, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+            paths.append(target)
+        return tuple(paths)
 
 def extract_libs_from_apk(apk_file: str, out_dir: str):
     with zipfile.ZipFile(apk_file, "r") as zf:
@@ -151,7 +181,7 @@ def cmake_blutter(input: BlutterInput):
     subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DDARTLIB={input.dart_info.lib_name}', f'-DNAME_SUFFIX={input.name_suffix}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'] + macros, cwd=blutter_dir, check=True, env=my_env)
 
     # build and install blutter
-    subprocess.run([NINJA_CMD], cwd=builddir, check=True)
+    subprocess.run([CMAKE_CMD, '--build', builddir], check=True)
     subprocess.run([CMAKE_CMD, '--install', '.'], cwd=builddir, check=True)
 
 def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
@@ -221,9 +251,13 @@ def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: 
     build_and_run(input)
 
 def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
-    if indir.endswith(".apk"):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            libapp_file, libflutter_file = extract_libs_from_apk(indir, tmp_dir)
+    extension = os.path.splitext(indir)[1].lower()
+    if os.path.isfile(indir) and extension in ('.apk', '.ipa', '.zip'):
+        scratch = os.path.join(SCRIPT_DIR, 'temp')
+        os.makedirs(scratch, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='blutter-input-', dir=scratch) as tmp_dir:
+            extract = extract_libs_from_apk if extension == '.apk' else extract_libs_from_apple_archive
+            libapp_file, libflutter_file = extract(indir, tmp_dir)
             main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
     else:
         libapp_file, libflutter_file = find_lib_files(indir)
@@ -234,8 +268,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog='B(l)utter',
         description='Reversing a flutter application tool')
-    # TODO: accept ipa
-    parser.add_argument('indir', help='An apk or a directory that contains both libapp.so and libflutter.so')
+    parser.add_argument('indir', help='An APK, IPA, macOS app ZIP, app bundle, or directory containing the AOT and engine binaries')
     parser.add_argument('outdir', help='An output directory')
     parser.add_argument('--rebuild', action='store_true', default=False, help='Force rebuild the Blutter executable')
     parser.add_argument('--vs-sln', action='store_true', default=False, help='Generate Visual Studio solution at <outdir>')

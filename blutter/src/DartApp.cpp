@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "DartApp.h"
 #include "ElfHelper.h"
+#include "MachOHelper.h"
 #include "DartLoader.h"
 PRAGMA_WARNING(push, 0)
 #include <vm/stub_code.h>
@@ -11,7 +12,8 @@ PRAGMA_WARNING(pop)
 
 DartApp::DartApp(const char* path) : ppool(NULL), nativeLib(0xdeadead), throwStubAddr(0)
 {
-	auto libInfo = ElfHelper::MapLibAppSo(path);
+	auto libInfo = MachOHelper::IsMachO(path) ? MachOHelper::MapLibApp(path) : ElfHelper::MapLibAppSo(path);
+	image_owner = std::move(libInfo.owner);
 	lib_base = libInfo.lib;
 	vm_snapshot_data = libInfo.vm_snapshot_data;
 	vm_snapshot_instructions = libInfo.vm_snapshot_instructions;
@@ -581,6 +583,9 @@ void DartApp::finalizeFunctionsInfo()
 	auto& func = dart::Function::Handle();
 	for (auto& [_, dartFn] : functions) {
 		func = dartFn->ptr;
+		// Obfuscated snapshots can retain Code without a Function owner.
+		if (func.IsNull())
+			continue;
 		const auto sigPtr = func.signature();
 		if (!sigPtr.IsHeapObject())
 			continue;

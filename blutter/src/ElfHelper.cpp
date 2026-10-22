@@ -1,191 +1,136 @@
-#include "pch.h"
 #include "ElfHelper.h"
-PRAGMA_WARNING(push, 0)
-#include <platform/elf.h>
-#if defined(DART_TARGET_OS_MACOS)
-// old dart version has no mach_o.h
-//#include <platform/mach_o.h>
-#endif
-PRAGMA_WARNING(pop)
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <fstream>
+#include <new>
+#include <span>
 #include <stdexcept>
-#if defined(_WIN32) || defined(WIN32)
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/stat.h>
-//#include <dlfcn.h>
-#include <sys/mman.h>
-#endif // #if defined(_WIN32) || defined(WIN32)
+#include <string>
+#include <string_view>
+#include <vector>
 
-struct ElfIdent {
-	uint8_t ei_magic[4];
-	uint8_t ei_class;
-	uint8_t ei_data;
-	uint8_t ei_version;
-	uint8_t ei_osabi;
-	uint8_t ei_abiversion;
-	uint8_t pad1[7];
+// ELF64 layouts: Dart SDK runtime/platform/elf.h. Build a virtual image,
+// not a file mapping: PT_LOAD offsets can differ and BSS has no file bytes.
+namespace {
+void Require(bool ok, const char* message) {
+    if (!ok) throw std::invalid_argument(std::string("ELF: ") + message);
+}
+struct Reader {
+    std::span<const uint8_t> bytes;
+    std::span<const uint8_t> Range(uint64_t offset, uint64_t size) const {
+        Require(offset <= bytes.size() && size <= bytes.size() - offset, "Read outside file");
+        return bytes.subspan(static_cast<size_t>(offset), static_cast<size_t>(size));
+    }
+    uint16_t U16(uint64_t offset) const {
+        auto b = Range(offset, 2); return uint16_t(b[0]) | uint16_t(b[1]) << 8;
+    }
+    uint32_t U32(uint64_t offset) const { return U16(offset) | uint32_t(U16(offset + 2)) << 16; }
+    uint64_t U64(uint64_t offset) const { return U32(offset) | uint64_t(U32(offset + 4)) << 32; }
 };
-
-using namespace dart::elf;
-
-#ifdef _WIN32
-static void* load_map_file(const char* path)
-{
-	HANDLE hFile = CreateFileA(path, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (hFile == INVALID_HANDLE_VALUE) {
-		printf("\nCannot find %s\n", path);
-		return NULL;
-	}
-
-	// because Dart API requires only snapshot buffer addresses (no relative access across snapshot),
-	//   so we can just mapping a whole file and find address of snapshots
-	HANDLE hMapFile = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-	if (hMapFile == INVALID_HANDLE_VALUE)
-		return NULL;
-
-	// need RW because dart initialization need writing data in BSS
-	void* mem = MapViewOfFile(hMapFile, FILE_MAP_COPY, 0, 0, 0);
-	CloseHandle(hMapFile);
-
-	CloseHandle(hFile);
-	return mem;
-}
-#else
-static void* load_map_file(const char* path)
-{
-	// need RW because dart initialization need writing data in BSS
-	int fd = open(path, O_RDONLY);
-	struct stat st;
-
-	fstat(fd, &st);
-	void* mem = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-
-	close(fd);
-	return mem;
-}
-#endif
-
-LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
-{
-	const auto* hdr = (const ElfHeader*)elf;
-	if (hdr->section_table_entry_size != sizeof(SectionHeader))
-		throw std::invalid_argument("ELF: Invalid section entry size");
-
-	const auto* section = (SectionHeader*)(elf + hdr->section_table_offset);
-	const auto sh_num = hdr->num_section_headers;
-
-	// find .dynstr and .dynsym sections, so we can map the section names
-	const char* dynstr = nullptr;
-	const Symbol* dynsym = nullptr;
-	const Symbol* dynsym_end = nullptr;
-	for (uint16_t i = 0; i < sh_num; i++, section++) {
-		if (section->type == SectionHeaderType::SHT_STRTAB && dynstr == nullptr) {
-			// we want only .dynstr for .dynsym
-			const char* strtab = (const char*)elf + section->file_offset;
-			const char* last = strtab + section->file_size;
-			const char* s_first = kVmSnapshotDataAsmSymbol;
-			const char* s_last = s_first + strlen(kVmSnapshotDataAsmSymbol) + 1;
-			//if (memmem(strtab, section->s_size, kVmSnapshotDataAsmSymbol, strlen(kVmSnapshotDataAsmSymbol))) {
-			if (std::search(strtab, last, s_first, s_last) != last) {
-				// found it
-				dynstr = strtab;
-			}
-		}
-		if (section->type == SectionHeaderType::SHT_DYNSYM) {
-			if (section->entry_size != sizeof(Symbol))
-				throw std::invalid_argument("ELF: Invalid DYNSYM entry size");
-			dynsym = (Symbol*)(elf + section->file_offset);
-			dynsym_end = (Symbol*)(elf + section->file_offset + section->file_size);
-		}
-		if (dynsym != nullptr && dynstr != nullptr)
-			break;
-	}
-
-	// find the required symbol addresses
-	const uint8_t* vm_snapshot_data = nullptr;
-	const uint8_t* vm_snapshot_instructions = nullptr;
-	const uint8_t* isolate_snapshot_data = nullptr;
-	const uint8_t* isolate_snapshot_instructions = nullptr;
-	for (; dynsym < dynsym_end; dynsym++) {
-		if (dynsym->info == 0)
-			continue;
-
-		const char* name = dynstr + dynsym->name;
-		// Note: sym_size is no needed for dart VM (its blob contains size)
-		if (strcmp(name, kVmSnapshotDataAsmSymbol) == 0) {
-			vm_snapshot_data = elf + dynsym->value;
-		}
-		else if (strcmp(name, kVmSnapshotInstructionsAsmSymbol) == 0) {
-			vm_snapshot_instructions = elf + dynsym->value;
-		}
-		else if (strcmp(name, kIsolateSnapshotDataAsmSymbol) == 0) {
-			isolate_snapshot_data = elf + dynsym->value;
-		}
-		else if (strcmp(name, kIsolateSnapshotInstructionsAsmSymbol) == 0) {
-			isolate_snapshot_instructions = elf + dynsym->value;
-		}
-	}
-
-	if (vm_snapshot_data == nullptr)
-		throw std::invalid_argument("ELF: Cannot find Dart VM Snapshot Data");
-	if (vm_snapshot_instructions == nullptr)
-		throw std::invalid_argument("ELF: Cannot find Dart VM Snapshot Instructions");
-	if (isolate_snapshot_data == nullptr)
-		throw std::invalid_argument("ELF: Cannot find Dart Isolate Snapshot Data");
-	if (isolate_snapshot_instructions == nullptr)
-		throw std::invalid_argument("ELF: Cannot find Dart Isolate Snapshot Instructions");
-
-	return LibAppInfo{
-		.lib = elf,
-		.vm_snapshot_data = vm_snapshot_data,
-		.vm_snapshot_instructions = vm_snapshot_instructions,
-		.isolate_snapshot_data = isolate_snapshot_data,
-		.isolate_snapshot_instructions = isolate_snapshot_instructions,
-	};
+struct Segment { uint64_t address, offset, fileSize, size; };
+constexpr uint64_t kMaxImageSize = uint64_t{1} << 30;
+constexpr size_t kAlignment = 0x10000;
 }
 
 LibAppInfo ElfHelper::MapLibAppSo(const char* path)
 {
-	void* lib = load_map_file(path);
-	// quick and dirty parsing ELF to get symbol addresses
-	uint8_t* elf = (uint8_t*)(lib);
-#if defined(DART_TARGET_OS_MACOS)
-	// Note: only new dart version getting snapshots from load command
-	// <=2.17, use EXPORT name
-	// <= v2.18,  load from sub SEGMENT_64, named "__CUSTOM" and section named "__dart_app_snap"
-	// >= 2.19, LC_NOTE command is used
-	auto header = (dart::mach_o::mach_header_64*)lib;
-	switch (header->magic) {
-	case dart::mach_o::MH_MAGIC:
-	case dart::mach_o::MH_CIGAM:
-		throw std::invalid_argument("Mach-O: Support only 64 bits");
-	case dart::mach_o::MH_CIGAM_64:
-		throw std::invalid_argument("Mach-O: Expected a host endian header");
-	case dart::mach_o::MH_MAGIC_64:
-		return size >= sizeof(mach_o::mach_header_64);
-	default:
-		throw std::invalid_argument("Mach-O: Invalid magic header");
-	}
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    Require(bool(input), "Cannot open input");
+    const auto length = input.tellg();
+    Require(length >= 64, "Truncated header");
+    std::vector<uint8_t> bytes(static_cast<size_t>(length));
+    input.seekg(0);
+    Require(bool(input.read(reinterpret_cast<char*>(bytes.data()), length)), "Truncated input");
+    const Reader file{bytes};
+    Require(std::memcmp(bytes.data(), "\x7f" "ELF", 4) == 0, "Invalid magic");
+    Require(bytes[4] == 2 && bytes[5] == 1 && bytes[6] == 1, "Expected little-endian ELF64");
+    Require(file.U16(16) == 3 && file.U32(20) == 1 && file.U16(52) == 64, "Invalid shared-object header");
+#if defined(TARGET_ARCH_X64)
+    Require(file.U16(18) == 62, "Expected x64 target");
 #else
-	const auto* hdr = (ElfHeader*)elf;
-	const auto* ident = (ElfIdent*)hdr->ident;
-	if (memcmp(ident->ei_magic, "\x7f" "ELF", 4) != 0)
-		throw std::invalid_argument("ELF: Invalid magic header"); // need ELF file
-	if (ident->ei_data != 1)
-		throw std::invalid_argument("ELF: Support only little endian"); // expect little-endian
-
-	if (ident->ei_class != ELFCLASS64) { // 1 is 32 bits, 2 is 64 bits
-		throw std::invalid_argument("ELF: Support only 64 bits"); // support only 64 bits
-	}
-	// expected e_machine
-	//   3: x86, 0x28: ARM
-	//   0x3e: x86-64, 0xB7: Aarch64
-	// EM_386, EM_ARM, EM_X86_64, EM_AARCH64
-	//hdr->e_machine;
+    Require(file.U16(18) == 183, "Expected ARM64 target");
 #endif
-
-	return findSnapshots(elf);
+    const auto phoff = file.U64(32), shoff = file.U64(40);
+    const auto phnum = file.U16(56), shnum = file.U16(60);
+    Require(file.U16(54) == 56 && file.U16(58) == 64 && phnum != 0 && shnum != 0,
+            "Invalid program or section table");
+    file.Range(phoff, uint64_t(phnum) * 56);
+    file.Range(shoff, uint64_t(shnum) * 64);
+    std::vector<Segment> segments;
+    for (uint32_t i = 0; i < phnum; ++i) {
+        const auto at = phoff + uint64_t(i) * 56;
+        if (file.U32(at) != 1) continue; // PT_LOAD
+        Segment s{file.U64(at + 16), file.U64(at + 8), file.U64(at + 32), file.U64(at + 40)};
+        Require(s.fileSize <= s.size, "Segment file size exceeds memory size");
+        file.Range(s.offset, s.fileSize);
+        Require(s.address <= kMaxImageSize && s.size <= kMaxImageSize - s.address,
+                "Image exceeds supported 1 GiB virtual range");
+        if (s.size != 0) segments.push_back(s);
+    }
+    Require(!segments.empty(), "Missing loadable segments");
+    std::sort(segments.begin(), segments.end(), [](const auto& a, const auto& b) { return a.address < b.address; });
+    Require(segments.front().address == 0, "Only zero-based snapshot images are supported");
+    uint64_t imageSize = 0;
+    for (const auto& s : segments) {
+        Require(s.address >= imageSize, "Overlapping virtual segments");
+        imageSize = s.address + s.size;
+    }
+    constexpr std::array<std::string_view, 4> names{
+        "_kDartVmSnapshotData", "_kDartVmSnapshotInstructions",
+        "_kDartIsolateSnapshotData", "_kDartIsolateSnapshotInstructions"};
+    std::array<uint64_t, 4> addresses{};
+    std::array<bool, 4> found{};
+    for (uint32_t i = 0; i < shnum; ++i) {
+        const auto at = shoff + uint64_t(i) * 64;
+        if (file.U32(at + 4) != 11) continue; // SHT_DYNSYM
+        const auto offset = file.U64(at + 24), size = file.U64(at + 32);
+        const auto link = file.U32(at + 40);
+        Require(file.U64(at + 56) == 24 && size % 24 == 0 && link < shnum, "Invalid dynamic symbol table");
+        file.Range(offset, size);
+        const auto str = shoff + uint64_t(link) * 64;
+        Require(file.U32(str + 4) == 3, "Invalid linked string table");
+        const auto stringsOffset = file.U64(str + 24), stringsSize = file.U64(str + 32);
+        file.Range(stringsOffset, stringsSize);
+        for (uint64_t index = 0; index < size / 24; ++index) {
+            const auto sym = offset + index * 24;
+            if (file.U16(sym + 6) == 0) continue; // SHN_UNDEF
+            const auto nameOffset = file.U32(sym);
+            Require(nameOffset < stringsSize, "Invalid symbol string offset");
+            auto text = file.Range(stringsOffset + nameOffset, stringsSize - nameOffset);
+            const auto* end = static_cast<const uint8_t*>(std::memchr(text.data(), 0, text.size()));
+            Require(end != nullptr, "Unterminated symbol name");
+            const auto match = std::find(names.begin(), names.end(),
+                std::string_view(reinterpret_cast<const char*>(text.data()), end - text.data()));
+            if (match == names.end()) continue;
+            const auto n = static_cast<size_t>(match - names.begin());
+            Require(!found[n], "Duplicate snapshot symbol");
+            const auto address = file.U64(sym + 8);
+            const uint64_t required = n % 2 == 0 ? 53 : 16;
+            const auto segment = std::find_if(segments.begin(), segments.end(), [&](const auto& s) {
+                return address >= s.address && address - s.address <= s.fileSize && required <= s.fileSize - (address - s.address);
+            });
+            Require(segment != segments.end() && address % 16 == 0, "Snapshot is unaligned or not file backed");
+            const auto data = segment->offset + address - segment->address;
+            const auto remaining = segment->fileSize - (address - segment->address);
+            if (n % 2 == 0) {
+                Require(file.U32(data) == 0xdcdcf5f5, "Invalid snapshot magic");
+                const auto snapshotSize = file.U64(data + 4);
+                Require(snapshotSize >= 49 && snapshotSize <= remaining - 4, "Invalid snapshot length");
+                auto flags = file.Range(data + 52, snapshotSize + 4 - 52);
+                Require(std::memchr(flags.data(), 0, flags.size()) != nullptr, "Unterminated snapshot flags");
+            } else {
+                Require(file.U64(data) >= 16 && file.U64(data) <= remaining, "Invalid instruction image length");
+            }
+            addresses[n] = address; found[n] = true;
+        }
+    }
+    Require(std::all_of(found.begin(), found.end(), [](bool v) { return v; }), "Missing Dart snapshot symbols");
+    std::shared_ptr<void> owner(::operator new(static_cast<size_t>(imageSize), std::align_val_t{kAlignment}),
+        [](void* p) { ::operator delete(p, std::align_val_t{kAlignment}); });
+    auto* image = static_cast<uint8_t*>(owner.get());
+    std::memset(image, 0, static_cast<size_t>(imageSize));
+    for (const auto& s : segments)
+        if (s.fileSize) std::memcpy(image + s.address, file.Range(s.offset, s.fileSize).data(), static_cast<size_t>(s.fileSize));
+    return LibAppInfo{image, image + addresses[0], image + addresses[1], image + addresses[2], image + addresses[3], std::move(owner)};
 }

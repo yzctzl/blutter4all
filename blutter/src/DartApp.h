@@ -4,6 +4,7 @@
 #include "DartFunction.h"
 #include "DartStub.h"
 #include <unordered_map>
+#include <memory>
 
 class DartApp
 {
@@ -43,6 +44,7 @@ private:
 	void loadFromObjectPool();
 	void walkObject(dart::Object& obj); // to check field types from existed object
 
+	std::shared_ptr<void> image_owner;
 	const void* lib_base;
 	const uint8_t* vm_snapshot_data;
 	const uint8_t* vm_snapshot_instructions;

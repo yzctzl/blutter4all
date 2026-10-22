@@ -2,10 +2,12 @@
 bin/
 build/
 tmp/
+temp/
 out/
 dartsdk/
 external/
 packages/
+.cache/
 # python
 __pycache__/
 *.py[cod]

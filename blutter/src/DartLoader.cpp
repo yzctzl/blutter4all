@@ -72,9 +72,14 @@ Dart_Isolate DartLoader::Load(LibAppInfo& libInfo)
 
 	init_dart(libInfo.vm_snapshot_data, libInfo.vm_snapshot_instructions);
 
-	auto isolate = load_isolate(libInfo.isolate_snapshot_data, libInfo.isolate_snapshot_instructions);
-
-	return isolate;
+	try {
+		return load_isolate(libInfo.isolate_snapshot_data, libInfo.isolate_snapshot_instructions);
+	} catch (...) {
+		// Release VM references before the caller releases its mapped image.
+		auto* cleanup_error = Dart_Cleanup();
+		(void)cleanup_error;
+		throw;
+	}
 }
 
 template<typename T>

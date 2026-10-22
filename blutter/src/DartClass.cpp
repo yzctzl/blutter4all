@@ -44,9 +44,8 @@ DartClass::DartClass(const DartLibrary& lib_, const dart::Class& cls) :
 		//auto& supCls = dart::Class::Handle(zone, cls.SuperClass());
 		auto supClsPtr = cls.SuperClass();
 		
-		auto superCid = supClsPtr.untag()->id();
-		if (superCid > 0 && (intptr_t)supClsPtr == (intptr_t)dart::Object::null())
-			superCid = 0;
+		// Dart's null object has no Class::id field; check before untagging.
+		auto superCid = supClsPtr == dart::Class::null() ? 0 : supClsPtr.untag()->id();
 		if (superCid)
 			superCls = (DartClass*)(intptr_t)superCid; // temporary save class id as pointer. it will be set correctly after all classes are loaded
 

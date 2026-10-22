@@ -260,6 +260,8 @@ void DartFunction::PrintHead(std::ostream& of) const
 	of << " {\n";
 
 	of << std::format("    // ** addr: {:#x}, size: {:#x}\n", ep_addr, size);
+	if (size < 0)
+		of << "    // Function body size is unavailable in snapshot metadata\n";
 }
 
 void DartFunction::PrintFoot(std::ostream& of) const

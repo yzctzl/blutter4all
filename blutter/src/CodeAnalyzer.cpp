@@ -18,7 +18,7 @@ void CodeAnalyzer::AnalyzeAll()
 			continue;
 		for (auto cls : lib->classes) {
 			for (auto dartFn : cls->Functions()) {
-				if (dartFn->Size() == 0)
+				if (dartFn->Size() <= 0)
 					continue;
 
 				// start from PayloadAddress or Address?

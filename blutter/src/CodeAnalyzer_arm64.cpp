@@ -183,18 +183,43 @@ static VarValue* getPoolObject(DartApp& app, intptr_t offset, A64::Register dstR
 	}
 }
 
+// ElementAddressForRegIndexWithSize uses SXTW for compressed Smis, and
+// a full-width LSL operand otherwise. The scale excludes the Smi tag bit.
+static bool matchesSmiIndex(const cs_arm64_op& operand, arm64_reg reg, uint32_t scale) {
+	if (operand.type != ARM64_OP_REG || ToCapstoneReg(operand.reg) != ToCapstoneReg(reg) || operand.shift.value != scale)
+		return false;
+#if defined(DART_COMPRESSED_POINTERS)
+	return operand.ext == ARM64_EXT_SXTW && GetCsRegSize(operand.reg) == 4;
+#else
+	return operand.ext == ARM64_EXT_INVALID && GetCsRegSize(operand.reg) == 8 &&
+		operand.shift.type == ARM64_SFT_LSL;
+#endif
+}
+
+static bool isSmiUntag(const AsmIterator& insn) {
+#if defined(DART_COMPRESSED_POINTERS)
+	return insn.id() == ARM64_INS_SBFX && insn.ops(2).imm == dart::kSmiTagSize && insn.ops(3).imm == dart::kSmiBits + 1;
+#else
+	return insn.id() == ARM64_INS_ASR && GetCsRegSize(insn.ops(0).reg) == 8 && insn.ops(2).imm == dart::kSmiTagSize;
+#endif
+}
+
 static inline void handleDecompressPointer(AsmIterator& insn, arm64_reg reg) {
+#if defined(DART_COMPRESSED_POINTERS)
 	INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 	INSN_ASSERT(insn.ops(0).reg == insn.ops(1).reg && insn.ops(0).reg == reg);
 	INSN_ASSERT(insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32);
 	++insn;
+#endif
 }
 
 static inline void handleExtraDecompressPointer(AsmIterator& insn, arm64_reg reg) {
+#if defined(DART_COMPRESSED_POINTERS)
 	if (insn.id() != ARM64_INS_ADD) return;
 	if (!(insn.ops(0).reg == insn.ops(1).reg && insn.ops(0).reg == reg)) return;
 	if (!(insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32)) return;
 	++insn;
+#endif
 }
 
 // Handle leave-frame restore patterns for newer Dart ARM64 codegen.
@@ -294,8 +319,8 @@ public:
 	std::unique_ptr<BranchIfSmiInstr> processBranchIfSmiInstr(AsmIterator& insn);
 	std::unique_ptr<LoadClassIdInstr> processLoadClassIdInstr(AsmIterator& insn);
 	std::unique_ptr<BoxInt64Instr> processBoxInt64Instr(AsmIterator& insn);
-	std::unique_ptr<LoadInt32Instr> processLoadInt32FromBoxOrSmiInstrFromSrcReg(AsmIterator& insn, A64::Register expectedSrcReg = A64::Register{});
-	std::unique_ptr<LoadInt32Instr> processLoadInt32FromBoxOrSmiInstr(AsmIterator& insn);
+	std::unique_ptr<UnboxIntInstr> processUnboxIntInstrFromSrcReg(AsmIterator& insn, A64::Register expectedSrcReg = A64::Register{});
+	std::unique_ptr<UnboxIntInstr> processUnboxIntInstr(AsmIterator& insn);
 	std::unique_ptr<LoadTaggedClassIdMayBeSmiInstr> processLoadTaggedClassIdMayBeSmiInstr(AsmIterator& insn);
 	std::unique_ptr<ILInstr> processLoadFieldTableInstr(AsmIterator& insn);
 	std::unique_ptr<AllocateObjectInstr> processTryAllocateObject(AsmIterator& insn);
@@ -358,7 +383,7 @@ static const AsmMatcherFn matcherFns[] = {
 	(AsmMatcherFn) &FunctionAnalyzer::processBranchIfSmiInstr,
 	(AsmMatcherFn) &FunctionAnalyzer::processLoadClassIdInstr,
 	(AsmMatcherFn) &FunctionAnalyzer::processBoxInt64Instr,
-	(AsmMatcherFn) &FunctionAnalyzer::processLoadInt32FromBoxOrSmiInstr,
+	(AsmMatcherFn) &FunctionAnalyzer::processUnboxIntInstr,
 	(AsmMatcherFn) &FunctionAnalyzer::processLoadTaggedClassIdMayBeSmiInstr,
 	&FunctionAnalyzer::processLoadFieldTableInstr,
 	(AsmMatcherFn) &FunctionAnalyzer::processTryAllocateObject,
@@ -911,7 +936,7 @@ std::tuple<A64::Register, A64::Register> FunctionAnalyzer::unboxParam(AsmIterato
 	}
 	else {
 		auto* saved_ins = insn.Current();
-		auto il = processLoadInt32FromBoxOrSmiInstrFromSrcReg(insn, expectedSrcReg);
+		auto il = processUnboxIntInstrFromSrcReg(insn, expectedSrcReg);
 		if (!il)
 			return { A64::Register{}, A64::Register{} };
 		// unbox from srcReg to dstReg
@@ -934,7 +959,7 @@ void FunctionAnalyzer::handleFixedParameters(AsmIterator& insn, arm64_reg paramC
 			break;
 		INSN_ASSERT(insn.ops(1).reg == CSREG_DART_FP);
 		// shift only 2 because the number of parameter is Smi (tagged)
-		INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == paramCntReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+		INSN_ASSERT(matchesSmiIndex(insn.ops(2), paramCntReg, dart::kWordSizeLog2 - dart::kSmiTagSize));
 		const auto tmpReg = insn.ops(0).reg;
 		++insn;
 
@@ -1006,7 +1031,7 @@ void FunctionAnalyzer::handleOptionalPositionalParameters(AsmIterator& insn, arm
 		// parameter might not be used and no loading value
 		if (insn.id() == ARM64_INS_ADD && insn.ops(1).reg == CSREG_DART_FP) {
 			// shift only 2 because the number of parameter is Smi (tagged)
-			INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == optionalParamCntReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+			INSN_ASSERT(matchesSmiIndex(insn.ops(2), optionalParamCntReg, dart::kWordSizeLog2 - dart::kSmiTagSize));
 			const auto tmpReg = insn.ops(0).reg;
 			++insn;
 
@@ -1148,12 +1173,12 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 
 				INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 				INSN_ASSERT(fnInfo->State()->GetValue(insn.ops(1).reg) == fnInfo->Vars()->ValArgsDesc());
-				INSN_ASSERT(insn.ops(2).reg == tmpReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 1);
+				INSN_ASSERT(matchesSmiIndex(insn.ops(2), tmpReg, dart::kCompressedWordSizeLog2 - dart::kSmiTagSize));
 				const auto tmpReg2 = insn.ops(0).reg;
 				++insn;
 
 				INSN_ASSERT(insn.id() == ARM64_INS_LDUR);
-				INSN_ASSERT(insn.ops(1).mem.base == tmpReg2 && insn.ops(1).mem.disp == sizeof(void*) * 2 - dart::kHeapObjectTag);
+				INSN_ASSERT(insn.ops(1).mem.base == tmpReg2 && insn.ops(1).mem.disp == dart::Array::data_offset() - dart::kHeapObjectTag);
 				const auto dstReg = ToCapstoneReg(insn.ops(0).reg);
 				++insn;
 
@@ -1351,7 +1376,7 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 
 			INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 			INSN_ASSERT(insn.ops(1).reg == CSREG_DART_FP);
-			INSN_ASSERT(insn.ops(2).reg == tmpReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+			INSN_ASSERT(matchesSmiIndex(insn.ops(2), tmpReg, dart::kWordSizeLog2 - dart::kSmiTagSize));
 			const auto tmpReg2 = insn.ops(0).reg;
 			++insn;
 
@@ -1405,9 +1430,8 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 			// Smi to native. only non first and last name do it
 			if (nameParamCnt && !isLastName) {
 				// 0x412924: sbfx  x5, x2, #1, #0x1f
-				if (insn.id() == ARM64_INS_SBFX) {
+				if (isSmiUntag(insn)) {
 					INSN_ASSERT(fnInfo->State()->GetValue(insn.ops(1).reg) == &valNameCurrParamPosSmi);
-					INSN_ASSERT(insn.ops(2).imm == 1 && insn.ops(3).imm == 0x1f);
 					fnInfo->State()->SetRegister(insn.ops(0).reg, fnInfo->Vars()->ValCurrNumNameParam());
 					++insn;
 				}
@@ -1455,7 +1479,7 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 			}
 
 			// TODO: split state for match and mismatch branch, so all param can be tracked correctly
-			if (insn.id() == ARM64_INS_SBFX && insn.ops(2).imm == 1 && insn.ops(3).imm == 0x1f) {
+			if (isSmiUntag(insn)) {
 				// assume curr param pos Smi to native in default branch
 				++insn;
 			}
@@ -1595,7 +1619,7 @@ void FunctionAnalyzer::handleArgumentsDescriptorTypeArguments(AsmIterator& insn)
 
 	INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 	INSN_ASSERT(insn.ops(1).reg == CSREG_DART_FP);
-	INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == sizeReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+	INSN_ASSERT(matchesSmiIndex(insn.ops(2), sizeReg, dart::kWordSizeLog2 - dart::kSmiTagSize));
 	const auto tmpReg = insn.ops(0).reg;
 	fnInfo->State()->ClearRegister(tmpReg);
 	++insn;
@@ -2494,6 +2518,7 @@ std::unique_ptr<MoveRegInstr> FunctionAnalyzer::processMoveRegInstr(AsmIterator&
 
 std::unique_ptr<DecompressPointerInstr> FunctionAnalyzer::processDecompressPointerInstr(AsmIterator& insn)
 {
+#if defined(DART_COMPRESSED_POINTERS)
 	if (insn.id() == ARM64_INS_ADD && insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32) {
 		INSN_ASSERT(insn.ops(0).reg == insn.ops(1).reg);
 		const auto reg = A64::Register{ insn.ops(0).reg };
@@ -2501,6 +2526,7 @@ std::unique_ptr<DecompressPointerInstr> FunctionAnalyzer::processDecompressPoint
 		++insn;
 		return std::make_unique<DecompressPointerInstr>(insn.Wrap(ins0_addr), reg);
 	}
+#endif
 	return nullptr;
 }
 
@@ -2873,17 +2899,30 @@ std::unique_ptr<BoxInt64Instr> FunctionAnalyzer::processBoxInt64Instr(AsmIterato
 	// 0x21c5f4: bl  #0x2e5500  # AllocateMintSharedWithoutFPURegsStub
 	// 0x21c5f8: stur  x2, [x0, #7]
 	//   x0 is result object (can be Smi or Mint). x2 is source integer.
+#if defined(DART_COMPRESSED_POINTERS)
 	if (insn.id() == ARM64_INS_SBFIZ && insn.ops(2).imm == dart::kSmiTagSize && insn.ops(3).imm == 31) {
+#else
+	if (insn.id() == ARM64_INS_ADDS && insn.ops(2).type == ARM64_OP_REG &&
+		insn.ops(1).reg == insn.ops(2).reg && GetCsRegSize(insn.ops(0).reg) == 8 &&
+		insn.ops(2).ext == ARM64_EXT_INVALID && insn.ops(2).shift.value == 0) {
+#endif
 		const auto out_reg = insn.ops(0).reg;
 		const auto in_reg = insn.ops(1).reg;
 		InsnMarker marker(insn);
 		++insn;
 
-		if (insn.id() == ARM64_INS_CMP && insn.ops(0).reg == in_reg && insn.ops(1).reg == out_reg && insn.ops(1).shift.type == ARM64_SFT_ASR && insn.ops(1).shift.value == dart::kSmiTagSize) {
-			// branch if integer value is fit in 31 bits
+#if defined(DART_COMPRESSED_POINTERS)
+		const bool fitsSmi = insn.id() == ARM64_INS_CMP && insn.ops(0).reg == in_reg && insn.ops(1).reg == out_reg && insn.ops(1).shift.type == ARM64_SFT_ASR && insn.ops(1).shift.value == dart::kSmiTagSize;
+#else
+		const bool fitsSmi = insn.IsBranch(ARM64_CC_VC);
+#endif
+		if (fitsSmi) {
+			// Branch when the tagged value fits the target Smi width.
+#if defined(DART_COMPRESSED_POINTERS)
 			++insn;
 
 			INSN_ASSERT(insn.id() == ARM64_INS_B && insn.cc() == ARM64_CC_EQ);
+#endif
 			const auto contAddr = insn.ops(0).imm;
 			++insn;
 
@@ -2954,47 +2993,46 @@ std::unique_ptr<BoxInt64Instr> FunctionAnalyzer::processBoxInt64Instr(AsmIterato
 	return nullptr;
 }
 
-std::unique_ptr<LoadInt32Instr> FunctionAnalyzer::processLoadInt32FromBoxOrSmiInstrFromSrcReg(AsmIterator& insn, A64::Register expectedSrcReg)
+std::unique_ptr<UnboxIntInstr> FunctionAnalyzer::processUnboxIntInstrFromSrcReg(AsmIterator& insn, A64::Register expectedSrcReg)
 {
-	// From UnboxInstr::EmitLoadInt32FromBoxOrSmi(), includes branch if Smi
-	//   output is raw integer, input is Dart object
-	if (insn.id() == ARM64_INS_SBFX && insn.ops(2).imm == dart::kSmiTagSize && insn.ops(3).imm == 31) {
-		const auto in_reg = insn.ops(1).reg;
-		const auto srcReg = A64::Register{ in_reg };
-		if (!expectedSrcReg.IsSet() || expectedSrcReg == srcReg) {
-			const auto out_reg = insn.ops(0).reg;
-			const auto dstReg = A64::Register{ out_reg };
-			const auto ins0_addr = insn.address();
-			++insn;
-			// TODO: make srcReg type in current function register to be Smi
-
-			if (insn.id() == ARM64_INS_TBZ && A64::Register{ insn.ops(0).reg } == srcReg && insn.ops(1).imm == dart::kSmiTag) {
-				// if not smi, get raw integer from Mint object
-				// these instructions might not be here because compiler know the value is always be Smi
-				const auto cont_addr = insn.ops(2).imm;
-				++insn;
-
-				INSN_ASSERT(insn.id() == ARM64_INS_LDUR);
-				INSN_ASSERT(insn.ops(0).reg == out_reg);
-				INSN_ASSERT(insn.ops(1).mem.base == in_reg && insn.ops(1).mem.disp == dart::Mint::value_offset() - dart::kHeapObjectTag);
-				++insn;
-
-				// srcReg item type MUST be Mint
-				INSN_ASSERT(insn.address() == cont_addr);
-			}
-			else {
-				// srcReg object is always Smi
-			}
-
-			return std::make_unique<LoadInt32Instr>(insn.Wrap(ins0_addr), dstReg, srcReg);
-		}
+	// SDK EmitLoadInt{32,64}FromBoxOrSmi: narrow conversion truncates;
+	// full-width conversion uses SmiUntag followed by a full Mint load.
+	const bool narrow = insn.id() == ARM64_INS_SBFX && insn.ops(2).imm == dart::kSmiTagSize &&
+		insn.ops(3).imm == std::min<intptr_t>(32, dart::kSmiBits);
+	const bool full = isSmiUntag(insn);
+	if (!narrow && !full)
+		return nullptr;
+	const auto inReg = insn.ops(1).reg;
+	const auto srcReg = A64::Register{ inReg };
+	if (expectedSrcReg.IsSet() && expectedSrcReg != srcReg)
+		return nullptr;
+	const auto outReg = insn.ops(0).reg;
+	const auto bits = narrow ? 32 : 64;
+	InsnMarker marker(insn);
+	++insn;
+	if (insn.id() == ARM64_INS_TBZ && A64::Register{ insn.ops(0).reg } == srcReg && insn.ops(1).imm == dart::kSmiTag) {
+		const auto contAddr = insn.ops(2).imm;
+		++insn;
+		INSN_ASSERT(insn.id() == (narrow ? ARM64_INS_LDURSW : ARM64_INS_LDUR));
+		INSN_ASSERT(insn.ops(0).reg == outReg);
+		INSN_ASSERT(insn.ops(1).mem.base == inReg && insn.ops(1).mem.disp == dart::Mint::value_offset() - dart::kHeapObjectTag);
+		++insn;
+		INSN_ASSERT(insn.address() == contAddr);
 	}
-	return nullptr;
+	else {
+		// A bare shift/bitfield can be ordinary arithmetic. Accept it only for a
+		// tracked parameter or an already known Smi, not just its shape.
+		const auto state = fnInfo->State();
+		const auto value = state ? state->GetValue(inReg) : nullptr;
+		if (!value || (value->RawTypeId() != VarValue::Parameter && value->TypeId() != dart::kSmiCid))
+			return nullptr;
+	}
+	return std::make_unique<UnboxIntInstr>(insn.Wrap(marker.Take()), A64::Register{outReg}, srcReg, bits);
 }
 
-std::unique_ptr<LoadInt32Instr> FunctionAnalyzer::processLoadInt32FromBoxOrSmiInstr(AsmIterator& insn)
+std::unique_ptr<UnboxIntInstr> FunctionAnalyzer::processUnboxIntInstr(AsmIterator& insn)
 {
-	return processLoadInt32FromBoxOrSmiInstrFromSrcReg(insn);
+	return processUnboxIntInstrFromSrcReg(insn);
 }
 
 std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadFieldTableInstr(AsmIterator& insn)
@@ -3033,7 +3071,9 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadFieldTableInstr(AsmIterato
 
 		INSN_ASSERT(insn.ops(1).mem.base == tmp_reg);
 		load_offset |= insn.ops(1).mem.disp;
-		const auto field_offset = load_offset >> 1;
+		// FieldTable entries are full pointers; Field::TargetOffset uses
+		// compressed-word units, including on targets without compression.
+		const auto field_offset = load_offset >> (dart::kWordSizeLog2 - dart::kCompressedWordSizeLog2);
 
 		if (insn.id() == ARM64_INS_STR) {
 			const auto reg = A64::Register{ insn.ops(0).reg };
@@ -3361,13 +3401,13 @@ static ArrayOp getArrayOp(AsmIterator& insn, int32_t arr_data_offset)
 		// for 64 bit integer, LDUR is used too
 		const auto regSize = GetCsRegSize(insn.ops(0).reg);
 		//if (regSize == dart::kCompressedWordSize)
-		return ArrayOp(regSize, true, arr_data_offset == 0x17 ? ArrayOp::List : ArrayOp::Unknown);
+		return ArrayOp(regSize, true, arr_data_offset == dart::UntaggedTypedData::payload_offset() - dart::kHeapObjectTag ? ArrayOp::List : ArrayOp::Unknown);
 		//return ArrayOp(regSize, true, ArrayOp::TypedUnknown);
 	}
 	case ARM64_INS_LDURSW:
 		return ArrayOp(4, true, ArrayOp::TypedSigned);
 	case ARM64_INS_LDRB:
-		return ArrayOp(1, true, arr_data_offset == 0x17 ? ArrayOp::List : ArrayOp::TypedUnsigned);
+		return ArrayOp(1, true, arr_data_offset == dart::UntaggedTypedData::payload_offset() - dart::kHeapObjectTag ? ArrayOp::List : ArrayOp::TypedUnsigned);
 	case ARM64_INS_LDRSB:
 		return ArrayOp(1, true, ArrayOp::TypedSigned);
 	case ARM64_INS_LDRH:
@@ -3377,7 +3417,7 @@ static ArrayOp getArrayOp(AsmIterator& insn, int32_t arr_data_offset)
 	case ARM64_INS_STUR: {
 		const auto regSize = GetCsRegSize(insn.ops(0).reg);
 		//if (regSize == dart::kCompressedWordSize)
-		return ArrayOp(regSize, false, arr_data_offset == 0x17 ? ArrayOp::List : ArrayOp::Unknown);
+		return ArrayOp(regSize, false, arr_data_offset == dart::UntaggedTypedData::payload_offset() - dart::kHeapObjectTag ? ArrayOp::List : ArrayOp::Unknown);
 		//return ArrayOp(regSize, false, ArrayOp::TypedUnknown);
 	}
 	case ARM64_INS_STRB:
@@ -3536,7 +3576,8 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 				INSN_ASSERT(shift.value == idxShiftVal);
 			}
 			bool isTypedData = dart::UntaggedTypedData::payload_offset() - dart::kHeapObjectTag == arr_data_offset;
-			INSN_ASSERT(isTypedData || arr_data_offset == dart::Array::data_offset() - dart::kHeapObjectTag);
+			if (!isTypedData && arr_data_offset != dart::Array::data_offset() - dart::kHeapObjectTag)
+				return nullptr; // An address calculation alone does not prove an array access.
 			const auto op0Reg = A64::Register{ insn.ops(0).reg };
 			++insn;
 			if (arrayOp.isLoad) {

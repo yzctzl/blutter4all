@@ -53,9 +53,13 @@ int main(int argc, char** argv)
 		dumper.DumpCode((outDir / "asm").string().c_str());
 		dumper.Dump4Ida(outDir / "ida_script");
 
+#if defined(DART_COMPRESSED_POINTERS)
 		std::cout << "Generating Frida script\n";
 		FridaWriter fwriter{ app };
 		fwriter.Create((outDir / "blutter_frida.js").string().c_str());
+#else
+		std::cout << "Skipping Frida script: the current template requires compressed pointers\n";
+#endif
 
 		app.ExitScope();
 	}
@@ -75,6 +79,7 @@ int main(int argc, char** argv)
 	}
 	catch (std::exception& e) {
 		std::cerr << "exception: " << e.what() << "\n";
+		return 1;
 	}
 
 	return 0;

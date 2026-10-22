@@ -30,7 +30,7 @@ public:
 		LoadClassId,
 		LoadTaggedClassIdMayBeSmi,
 		BoxInt64,
-		LoadInt32,
+		UnboxInt,
 		AllocateObject,
 		LoadArrayElement,
 		StoreArrayElement,
@@ -404,19 +404,20 @@ public:
 	A64::Register srcReg;
 };
 
-class LoadInt32Instr : public ILInstr {
+class UnboxIntInstr : public ILInstr {
 public:
-	LoadInt32Instr(AddrRange addrRange, A64::Register dstReg, A64::Register srcObjReg) : ILInstr(LoadInt32, addrRange), dstReg(dstReg), srcObjReg(srcObjReg) {}
-	LoadInt32Instr() = delete;
-	LoadInt32Instr(LoadInt32Instr&&) = delete;
-	LoadInt32Instr& operator=(const LoadInt32Instr&) = delete;
+	UnboxIntInstr(AddrRange addrRange, A64::Register dstReg, A64::Register srcObjReg, int bits) : ILInstr(UnboxInt, addrRange), dstReg(dstReg), srcObjReg(srcObjReg), bits(bits) {}
+	UnboxIntInstr() = delete;
+	UnboxIntInstr(UnboxIntInstr&&) = delete;
+	UnboxIntInstr& operator=(const UnboxIntInstr&) = delete;
 
 	virtual std::string ToString() {
-		return std::format("{} = LoadInt32Instr({})", dstReg.Name(), srcObjReg.Name());
+		return std::format("{} = UnboxInt{}Instr({})", dstReg.Name(), bits, srcObjReg.Name());
 	}
 
 	A64::Register dstReg;
 	A64::Register srcObjReg;
+	int bits;
 };
 
 class AllocateObjectInstr : public ILInstr {

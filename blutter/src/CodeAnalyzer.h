@@ -101,6 +101,7 @@ struct FnParams {
 
 	uint8_t numFixedParam{ 0 };
 	bool isNamedParam{ false };
+	bool isPartial{ false }; // Proven parameter subset; declaration may be trimmed.
 	std::vector<FnParamInfo> params;
 };
 
@@ -182,6 +183,8 @@ public:
 	bool useFramePointer{ false };
 	uint64_t firstCheckStackOverflowAddr{ 0 };
 	FnParams params;
+	// Observed x64 entry locations; no declaration order, arity or optionality inferred.
+	std::vector<FnParamInfo> incomingParameters;
 	std::vector<std::unique_ptr<ILInstr>> il_insns;
 	DartType* returnType{ nullptr };
 

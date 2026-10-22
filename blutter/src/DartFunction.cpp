@@ -260,6 +260,15 @@ void DartFunction::PrintHead(std::ostream& of) const
 	of << " {\n";
 
 	of << std::format("    // ** addr: {:#x}, size: {:#x}\n", ep_addr, size);
+	if (analyzedData && !analyzedData->incomingParameters.empty()) {
+		of << "    // Incoming parameters (partial, entry block): ";
+		for (size_t i = 0; i < analyzedData->incomingParameters.size(); ++i) {
+			if (i)
+				of << ", ";
+			of << analyzedData->incomingParameters[i].ToString();
+		}
+		of << "\n";
+	}
 	if (size < 0)
 		of << "    // Function body size is unavailable in snapshot metadata\n";
 }

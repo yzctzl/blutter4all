@@ -88,6 +88,17 @@ std::optional<int64_t> integerConstant(const cs_insn& insn)
 	return std::nullopt;
 }
 
+// SDK flow_graph_compiler_x64.cc, ParallelMoveEmitter::EmitSwap.
+// A full-width register exchange preserves both values. Partial-register and
+// memory XCHG have different semantics and do not propagate parameter sources.
+bool isRegisterSwap(const cs_insn& insn)
+{
+	const auto& x = insn.detail->x86;
+	if (insn.id != X86_INS_XCHG || x.op_count != 2)
+		return false;
+	return isRegisterOfSize(x.operands[0], dart::kWordSize) &&
+		isRegisterOfSize(x.operands[1], dart::kWordSize);
+}
 
 // Decode direct edges once per function. Matchers share instruction boundaries
 // and predecessor checks; this is an index, not a control-flow analysis.
@@ -165,6 +176,10 @@ void visitWrittenRegisters(const cs_insn& insn, Visitor visit)
 
 // These predicates describe entry-block boundaries, not parameter patterns.
 // Frame aliases stop provenance because later indirect writes may reuse a slot.
+bool isFrameRegister(x86_reg reg)
+{
+	return reg == X86_REG_RBP || reg == X86_REG_RSP;
+}
 
 bool isVmStateRegister(Reg reg)
 {
@@ -202,6 +217,15 @@ bool isStackLimitCompare(const cs_insn& insn)
 	return isMemoryOperand(x.operands[1], CSREG_DART_THR, dart::Thread::stack_limit_offset());
 }
 
+bool escapesFrame(const cs_insn& insn)
+{
+	const auto& x = insn.detail->x86;
+	if (x.op_count != 2) return false;
+	const auto& source = x.operands[1];
+	if (insn.id == X86_INS_LEA)
+		return source.type == X86_OP_MEM && isFrameRegister(source.mem.base);
+	return isMoveInstruction(insn.id) && source.type == X86_OP_REG && isFrameRegister(source.reg);
+}
 
 // Like ARM64's getArrayOp, decode the memory operation before assigning Dart
 // semantics. A MOV between registers or an immediate store is not this shape.
@@ -359,7 +383,58 @@ static std::unique_ptr<InitAsyncInstr> processInitAsyncInstr(
 	return std::make_unique<InitAsyncInstr>(AddrRange(load->Start(), callRange.end), returnType);
 }
 #endif
+// The entry frame bounds incoming stack slots and local spills. Optional
+// stack allocation is not a parameter operation.
+// Capstone reports XMM register width as 16 even for scalar MOVSD. Only the
+// low word is a parameter value; a memory operand must still be exactly 8 bytes.
+// SDK flow_graph_compiler_x64.cc, FlowGraphCompiler::EmitMove:
+// MOVAPS is the normal FPU register copy, including unboxed Doubles.
+// Accept vector copies only between XMM registers, never vector stack spills.
+bool isParameterValueMove(const cs_insn& insn)
+{
+	const auto& x = insn.detail->x86;
+	if (x.op_count != 2 || x.addr_size != dart::kWordSize)
+		return false;
+	// MOVQ preserves the complete scalar bits across CPU/XMM registers. It
+	// proves a source transfer, not a Dart double/integer declaration type.
+	if (insn.id == X86_INS_MOVQ && x.operands[0].type == X86_OP_REG && x.operands[1].type == X86_OP_REG) {
+		const Reg dst{x.operands[0].reg}, src{x.operands[1].reg};
+		return dst.IsSet() && src.IsSet() && dst.IsDecimal() != src.IsDecimal() &&
+			x.operands[dst.IsDecimal() ? 1 : 0].size == dart::kWordSize;
+	}
+	if (insn.id == X86_INS_MOVAPS || insn.id == X86_INS_MOVAPD) {
+		for (const auto& op : {x.operands[0], x.operands[1]})
+			if (op.type != X86_OP_REG || !Reg{op.reg}.IsDecimal())
+				return false;
+		return true;
+	}
+	if (insn.id != X86_INS_MOVSD)
+		return isMoveInstruction(insn.id) && x.operands[0].size == dart::kWordSize &&
+			x.operands[1].size == dart::kWordSize;
+	for (const auto& op : {x.operands[0], x.operands[1]}) {
+		if (op.type == X86_OP_MEM && op.size == 8)
+			continue;
+		if (op.type != X86_OP_REG || !Reg{op.reg}.IsDecimal())
+			return false;
+	}
+	return true;
+}
 
+bool endsParameterEntry(const cs_insn& insn, const BranchTargets& targets)
+{
+	if (targets.contains(insn.address))
+		return true;
+	if (isControlTransfer(insn) || isTrap(insn))
+		return true;
+	if (isStackLimitCompare(insn) || escapesFrame(insn))
+		return true;
+
+	bool writesFrame = false;
+	visitWrittenRegisters(insn, [&](Reg reg) {
+		writesFrame |= reg == Reg{dart::FPREG} || reg == Reg{dart::SPREG};
+	});
+	return writesFrame;
+}
 
 // A matcher gets its own cursor. Failure discards that cursor; only a complete
 // match advances the main loop. Unlike ARM64, x64 has variable-size instructions,
@@ -428,6 +503,26 @@ private:
 	size_t index;
 };
 
+bool readEntryFrame(AsmInstructions& instructions, const BranchTargets& targets,
+	size_t& begin, int64_t& frameSize)
+{
+	InsnCursor cursor{instructions, targets, 0};
+	if (!cursor.Is(X86_INS_PUSH, 1) || !isRegisterOperand(cursor.Op(0), X86_REG_RBP) ||
+		targets.contains(cursor.Current()->address))
+		return false;
+	cursor.Next();
+	if (!cursor.Move(X86_REG_RBP, X86_REG_RSP))
+		return false;
+	cursor.Next();
+	begin = cursor.Position();
+	frameSize = 0;
+	if (cursor.Is(X86_INS_SUB, 2) && isRegisterOperand(cursor.Op(0), X86_REG_RSP) &&
+		cursor.Op(1).type == X86_OP_IMM && cursor.Op(1).imm > 0 && cursor.Op(1).imm <= INT32_MAX) {
+		frameSize = cursor.Op(1).imm;
+		++begin;
+	}
+	return true;
+}
 
 // SDK CallCFunction reserves target-ABI shadow space. Its optional immediate
 // restoration uses the same size; by default the surrounding scope restores
@@ -2139,6 +2234,1068 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processRegisterSaveInstr(InsnCursor& 
 	return nullptr;
 }
 
+// Entry-prologue recovery, deliberately not whole-function type inference.
+// SDK authority: frontend/prologue_builder.cc, BuildParameterHandling,
+// BuildClosureContextHandling and BuildTypeArgumentsHandling; backend/il_x64.cc
+// LoadIndexed/LoadFpRelativeSlot; backend/dart_calling_conventions.cc.
+namespace {
+
+class X64ParameterRecovery {
+public:
+	X64ParameterRecovery(DartApp& app, DartFunction& function, AnalyzedFnData& data,
+		AsmInstructions& instructions, const BranchTargets& targets)
+		: app(app), function(function), data(data), instructions(instructions), targets(targets) {}
+	void Recover();
+
+private:
+	enum Kind { Unknown, ZeroIndex, NullValue, Descriptor, Count, OptionalCount, DescriptorSize, TypeArgsLength, DescriptorName, Position, CountMinusPosition,
+		NamedValue, UnboxedNamedValue, IncomingValue, ParameterValue, StackValue, ClosureValue, ContextValue, TypeArgsValue };
+	struct Source {
+		Kind kind{Unknown};
+		int value{0};
+		bool operator==(const Source&) const = default;
+	};
+	using Registers = std::array<Source, Reg::kNumberOfRegisters>;
+	struct DefaultConstant { std::unique_ptr<VarValue> value; size_t origin{0}; };
+	using DefaultValues = std::array<DefaultConstant, Reg::kNumberOfRegisters>;
+	using Locals = std::unordered_map<int64_t, Source>;
+	struct LocalScope {
+		Locals& state;
+		Locals saved;
+		explicit LocalScope(Locals& state) : state(state), saved(state) {}
+		~LocalScope() { state = std::move(saved); }
+	};
+	struct NamedResult {
+		Registers registers{};
+		FnParamInfo parameter;
+		size_t join{0};
+		bool isNamed{true};
+		int optional{-1};
+		std::vector<Reg> locations;
+	};
+	void signature();
+	Source source(const cs_x86_op& operand, const Registers& registers, bool incoming = false);
+	void transfer(const cs_insn& insn, Registers& registers, bool commit = false);
+	void invalidate(const cs_insn& insn, Registers& registers, bool commit);
+	void writtenRegister(Reg reg, Registers& registers, bool commit);
+	void recordLocation(Source source, Reg reg, int64_t spill = 0);
+	std::unique_ptr<VarValue> constant(const cs_x86_op& operand, bool unboxedDouble = false);
+	std::optional<std::string> comparedName(const cs_insn& insn, const Registers& registers);
+	struct DefaultPath {
+		size_t start;
+		Registers registers;
+		std::string name;
+		int optional;
+		DefaultValues defaults{};
+	};
+	std::vector<NamedResult> parameterDefaults(size_t index, const Registers& registers);
+	std::vector<NamedResult> defaultResults(std::vector<DefaultPath>& missing, const Registers& supplied, size_t join);
+	std::optional<NamedResult> unusedNamed(size_t index, size_t join, const Registers& registers);
+	bool unboxParameter(size_t& index, size_t end, Registers& registers,
+		std::vector<std::pair<size_t, size_t>>& edges);
+	bool traceDefault(size_t index, DefaultPath& path);
+	std::optional<NamedResult> typeArguments(size_t index, const Registers& registers);
+	int publish(FnParamInfo&& parameter, bool isNamed, int optional);
+	void seedIncoming(Registers& registers);
+	Source stackSource(int64_t offset, int countBias = -1, int namedEntry = -1);
+	void finishIncoming(Registers& registers);
+	void bindIncoming(Registers& registers);
+	void descriptorTypeArguments(size_t begin);
+	void combine(size_t begin, size_t end);
+	bool parameterMove(const cs_insn& insn, const Registers& registers);
+	bool parameterInstruction(const cs_insn& insn, const Registers& registers) const;
+
+	DartApp& app;
+	DartFunction& function;
+	AnalyzedFnData& data;
+	AsmInstructions& instructions;
+	const BranchTargets& targets;
+	int64_t frameSize{0};
+	int observedStackTop{0};
+	bool suspendState{false};
+	bool hasDeclaration{false};
+	Locals locals;
+	// Candidate entry locations are not declaration ordinals. The same Source
+	// values follow copies/spills until the first entry boundary; only observed
+	// bindings are published, then rebound to explicitly partial parameters.
+	struct Binding {
+		FnParamInfo info;
+		bool observed{false};
+		int parameter{-1};
+		int countBias{-1};
+		int64_t indexedOffset{0};
+		int namedEntry{-1};
+	};
+	std::vector<Binding> bindings;
+	Reg receiver;
+	int receiverParameter{-1};
+	bool observingIncoming{false};
+	std::vector<std::pair<int64_t, int64_t>> overwrittenIncoming;
+};
+
+void X64ParameterRecovery::seedIncoming(Registers& registers)
+{
+#if __has_include("vm/compiler/backend/dart_calling_conventions.h")
+	// SDK Function::MaxNumberOfParametersInRegisters excludes closures,
+	// dispatch helpers and generic functions. Admit ordinary Dart functions
+	// only. Do not substitute native Win64/SysV registers.
+	const auto& vmFunction = dart::Function::Handle(function.Ptr());
+	bool registerConvention = vmFunction.IsRegularFunction() ||
+		vmFunction.kind() == dart::UntaggedFunction::kConstructor ||
+		function.Kind() == DartFunction::GETTER || function.Kind() == DartFunction::SETTER;
+	const auto signature = vmFunction.signature();
+	if (signature.IsHeapObject()) {
+		if (!dart::FunctionType::Handle(signature).IsNull() && vmFunction.IsGeneric())
+			registerConvention = false;
+	}
+	if (registerConvention) {
+		if (!function.IsStatic())
+			receiver = Reg{dart::DartCallingConvention::kCpuRegistersForArgs[0]};
+		auto addRegister = [&](Reg reg) {
+			FnParamInfo info;
+			info.paramReg = reg;
+			info.name = std::string("arg_") + reg.Name();
+			registers[reg] = {IncomingValue, static_cast<int>(bindings.size())};
+			bindings.push_back({std::move(info)});
+		};
+		for (auto reg : dart::DartCallingConvention::kCpuRegistersForArgs)
+			addRegister(Reg{reg});
+		for (auto reg : dart::DartCallingConvention::kFpuRegistersForArgs)
+			addRegister(Reg{static_cast<Reg::Value>(int(Reg::XMM0) + int(reg))});
+	}
+#endif
+}
+
+void X64ParameterRecovery::signature()
+{
+	if (function.Ptr() == dart::Function::null())
+		return;
+	const auto& vmFunction = dart::Function::Handle(function.Ptr());
+	const auto& sig = dart::FunctionType::Handle(vmFunction.signature());
+	const bool accessor = function.Kind() == DartFunction::GETTER || function.Kind() == DartFunction::SETTER;
+	if (sig.IsNull() && !accessor) {
+		// NumImplicitParameters proves the receiver declaration even when no
+		// entry copy survives. It does not prove a complete regular signature.
+		if (vmFunction.IsRegularFunction() && !function.IsStatic() && !function.IsClosure()) {
+			FnParamInfo parameter{"this"};
+			parameter.type = function.Class().DeclarationType();
+			receiverParameter = data.params.NumParam();
+			data.params.addFixedParam(std::move(parameter));
+			data.params.isPartial = true;
+		}
+		return;
+	}
+	// Dart accessors have a language-defined arity even when their signature
+	// was stripped. This proves the declaration count, not erased names/types
+	// or the representation/location of an optimized-away setter value.
+	const auto count = sig.IsNull() ? vmFunction.NumImplicitParameters() +
+		(function.Kind() == DartFunction::SETTER) : vmFunction.NumParameters();
+	if (count < 0 || count > UINT8_MAX)
+		return;
+	hasDeclaration = true;
+	data.params.numFixedParam = sig.IsNull() ? count : vmFunction.num_fixed_parameters();
+	data.params.isNamedParam = !sig.IsNull() && vmFunction.HasOptionalNamedParameters();
+	for (intptr_t i = 0; i < count; ++i) {
+		FnParamInfo parameter;
+		if (i < function.NumParam()) {
+			const auto& declaration = function.Params()[i];
+			parameter.name = declaration.name;
+			if (declaration.type && declaration.type->IsType())
+				parameter.type = declaration.type->AsType();
+		}
+		if (!function.IsStatic() && !function.IsClosure() && i == 0) {
+			parameter.name = "this";
+			parameter.type = function.Class().DeclarationType();
+		}
+		data.params.add(std::move(parameter));
+	}
+}
+
+X64ParameterRecovery::Source X64ParameterRecovery::source(
+	const cs_x86_op& operand, const Registers& registers, bool incoming)
+{
+	if (operand.type == X86_OP_REG) {
+		const Reg reg{operand.reg};
+		return reg.IsSet() ? registers[reg] : Source{};
+	}
+	if (operand.type != X86_OP_MEM || operand.mem.segment != X86_REG_INVALID)
+		return {};
+	const auto& address = operand.mem;
+	const Reg base{address.base};
+	if (!base.IsSet())
+		return {};
+	if ((function.IsClosure() || (function.IsAsync() && suspendState)) &&
+		address.index == X86_REG_INVALID &&
+		address.disp == AOT_Closure_context_offset - dart::kHeapObjectTag) {
+		const auto owner = registers[base];
+		const auto closureSlot = std::max(observedStackTop, data.asmTexts.MaxParamStackOffset());
+		const bool incomingClosure = owner.kind == ParameterValue && owner.value >= 0 &&
+			owner.value < data.params.NumParam() && closureSlot >= 2 * dart::kWordSize &&
+			data.params[owner.value].paramOffset == closureSlot;
+		const bool observedClosure = owner.kind == IncomingValue && bindings[owner.value].countBias < 0 &&
+			bindings[owner.value].namedEntry < 0 && closureSlot >= 2 * dart::kWordSize &&
+			bindings[owner.value].info.paramOffset == closureSlot;
+		if (owner.kind == ClosureValue || observedClosure || (owner.kind == StackValue &&
+			owner.value == closureSlot) || incomingClosure)
+			return {ContextValue};
+	}
+	if (base == Reg{Reg::RBP} && address.index == X86_REG_INVALID && address.disp < 0) {
+		const auto it = locals.find(address.disp);
+		return it == locals.end() ? Source{} : it->second;
+	}
+	if (base == Reg{dart::THR} && isMemoryOperand(operand, CSREG_DART_THR, dart::Thread::object_null_offset()))
+		return {NullValue};
+	const Reg index{address.index};
+	const bool zeroIndex = index.IsSet() && registers[index].kind == ZeroIndex &&
+		address.scale == dart::kWordSize / 2;
+	if (base == Reg{Reg::RBP} && (address.index == X86_REG_INVALID || zeroIndex) &&
+		address.disp >= 2 * dart::kWordSize && address.disp <= INT32_MAX &&
+		address.disp % dart::kWordSize == 0) {
+		for (const auto& [start, end] : overwrittenIncoming)
+			if (address.disp < end && start < address.disp + dart::kWordSize)
+				return {};
+		if (observingIncoming && address.index == X86_REG_INVALID)
+			return stackSource(address.disp);
+		for (int i = 0; i < data.params.NumParam(); ++i)
+			if (data.params[i].paramOffset == address.disp)
+				return {ParameterValue, i};
+		return {StackValue, static_cast<int>(address.disp)};
+	}
+	if (registers[base].kind == Descriptor) {
+		if (address.index == X86_REG_INVALID &&
+			address.disp == AOT_ArgumentsDescriptor_count_offset - dart::kHeapObjectTag)
+			return {Count};
+		if (address.index == X86_REG_INVALID &&
+			address.disp == AOT_ArgumentsDescriptor_size_offset - dart::kHeapObjectTag)
+			return {DescriptorSize};
+		if (address.index == X86_REG_INVALID &&
+			address.disp == AOT_ArgumentsDescriptor_type_args_len_offset - dart::kHeapObjectTag)
+			return {TypeArgsLength};
+		const auto entry = address.disp - (AOT_ArgumentsDescriptor_first_named_entry_offset - dart::kHeapObjectTag);
+		const auto stride = dart::ArgumentsDescriptor::named_entry_size();
+		if (address.index == X86_REG_INVALID && entry >= 0 && entry < UINT8_MAX * stride) {
+			if (entry % stride == dart::ArgumentsDescriptor::position_offset())
+				return {Position, static_cast<int>(entry / stride)};
+			if (entry % stride == dart::ArgumentsDescriptor::name_offset()) return {DescriptorName};
+		}
+		if (address.index != X86_REG_INVALID && address.scale == dart::kCompressedWordSize / 2 &&
+			address.disp == dart::Array::data_offset() - dart::kHeapObjectTag)
+			return {Position, -1}; // Dynamic entry: ordinal/name position is not yet proven.
+	}
+	if (base == Reg{Reg::RBP} && address.index != X86_REG_INVALID) {
+		const Reg index{address.index};
+		// PrologueBuilder copies mandatory stack arguments after skipping
+		// optional_count = argc - fixed_count. This is a symbolic incoming
+		// location, not a constant FP offset or a declaration ordinal.
+		if (observingIncoming && index.IsSet() && registers[index].kind == OptionalCount &&
+			address.scale == dart::kWordSize / 2 && address.disp >= 2 * dart::kWordSize &&
+			address.disp <= UINT8_MAX * dart::kWordSize && address.disp % dart::kWordSize == 0)
+			return stackSource(address.disp, registers[index].value);
+		if (index.IsSet() && registers[index].kind == CountMinusPosition &&
+			address.scale == dart::kWordSize / 2 && address.disp == dart::kWordSize) {
+			// Required named arguments have no comparison/default diamond.
+			// Retain their proven descriptor-entry identity, not an erased name
+			// or declaration ordinal. Speculative diamond paths stay NamedValue.
+			if (incoming && observingIncoming && registers[index].value >= 0)
+				return stackSource(address.disp, -1, registers[index].value);
+			return {NamedValue, -1};
+		}
+		if (index.IsSet() && (registers[index].kind == OptionalCount || registers[index].kind == Count) &&
+			address.scale == dart::kWordSize / 2 && address.disp <= dart::kWordSize &&
+			address.disp >= -UINT8_MAX * dart::kWordSize && address.disp % dart::kWordSize == 0)
+			return {NamedValue, static_cast<int>((dart::kWordSize - address.disp) / dart::kWordSize)};
+		if (index.IsSet() && registers[index].kind == DescriptorSize &&
+			address.scale == dart::kWordSize / 2 && address.disp == 2 * dart::kWordSize)
+			return {TypeArgsValue};
+	}
+	return {};
+}
+
+void X64ParameterRecovery::writtenRegister(Reg reg, Registers& registers, bool commit)
+{
+	if (!reg.IsSet()) return;
+	registers[reg] = {};
+	if (commit) for (auto& parameter : data.params.params)
+		if (parameter.valReg == reg) parameter.valReg.Clear();
+}
+
+void X64ParameterRecovery::invalidate(const cs_insn& insn, Registers& registers, bool commit)
+{
+	visitWrittenRegisters(insn, [&](Reg reg) { writtenRegister(reg, registers, commit); });
+	const auto& x = insn.detail->x86;
+	for (unsigned i = 0; i < x.op_count; ++i) {
+		const auto& op = x.operands[i];
+		if (!(op.access & CS_AC_WRITE))
+			continue;
+		if (op.type != X86_OP_MEM || op.mem.base != X86_REG_RBP)
+			continue;
+		const bool exact = isMemoryOperand(op, X86_REG_RBP);
+		const int64_t start = exact ? op.mem.disp : INT32_MIN;
+		const int64_t end = exact ? op.mem.disp + op.size : INT64_MAX;
+		if (commit)
+			overwrittenIncoming.emplace_back(start, end);
+		const auto overlaps = [&](int64_t offset) { return start < offset + dart::kWordSize && offset < end; };
+		if (commit) for (auto& parameter : data.params.params)
+			if (parameter.localOffset && overlaps(parameter.localOffset)) parameter.localOffset = 0;
+		std::erase_if(locals, [&](const auto& slot) { return overlaps(slot.first); });
+	}
+}
+
+// Parameter identity comes from the source, never from its new register number.
+void X64ParameterRecovery::recordLocation(Source source, Reg reg, int64_t spill)
+{
+	if (source.kind == IncomingValue) {
+		auto& binding = bindings[source.value];
+		binding.observed = true;
+		if (reg.IsSet()) binding.info.valReg = reg;
+		observedStackTop = std::max(observedStackTop, binding.info.paramOffset);
+	}
+	if (source.kind == StackValue)
+		observedStackTop = std::max(observedStackTop, source.value);
+	if (source.kind == ParameterValue && source.value >= 0 && source.value < data.params.NumParam()) {
+		if (reg.IsSet()) data.params[source.value].valReg = reg;
+		if (spill) data.params[source.value].localOffset = spill;
+	}
+}
+
+void X64ParameterRecovery::transfer(const cs_insn& insn, Registers& registers, bool commit)
+{
+	const auto& x = insn.detail->x86;
+	if (isRegisterSwap(insn)) {
+		const Reg left{x.operands[0].reg}, right{x.operands[1].reg};
+		std::swap(registers[left], registers[right]);
+		if (commit) {
+			recordLocation(registers[left], left);
+			recordLocation(registers[right], right);
+		}
+		return;
+	}
+	Source result;
+	Reg dst;
+	int64_t spill = 0;
+	if (x.op_count == 2 && x.addr_size == dart::kWordSize) {
+		const auto& left = x.operands[0];
+		const auto& right = x.operands[1];
+		if (isParameterValueMove(insn)) {
+			result = source(right, registers, commit);
+			// The supplied argument is already proven by descriptor arithmetic.
+			// Only its exact Double payload load may carry that source to XMM.
+			if (insn.id == X86_INS_MOVSD && right.type == X86_OP_MEM) {
+				const Reg object{right.mem.base};
+				if (object.IsSet() && registers[object].kind == NamedValue &&
+					isMemoryOperand(right, right.mem.base, dart::Double::value_offset() - dart::kHeapObjectTag))
+					result = registers[object];
+			}
+			if (left.type == X86_OP_REG)
+				dst = Reg{left.reg};
+			else if (isMemoryOperand(left, X86_REG_RBP) && left.mem.disp < 0 &&
+				left.mem.disp >= -frameSize && left.mem.disp % dart::kWordSize == 0)
+				spill = left.mem.disp;
+		}
+		if (insn.id == X86_INS_SUB && isRegisterOfSize(left, dart::kWordSize)) {
+			if (source(left, registers).kind == Count && source(right, registers).kind == Position) {
+				result = {CountMinusPosition, source(right, registers).value};
+				dst = Reg{left.reg};
+			}
+			if (source(left, registers).kind == Count && right.type == X86_OP_IMM &&
+				right.imm >= 0 && right.imm <= 2 * UINT8_MAX && (right.imm & 1) == 0) {
+				result = {OptionalCount, static_cast<int>(right.imm >> 1)};
+				dst = Reg{left.reg};
+			}
+		}
+	}
+	// Async entry uses a literal zero optional-count index, then accesses
+	// the closure/context parameter through FP + index*4 + slot. Require the
+	// exact zero definition; an arbitrary indexed FP access has no fixed slot.
+	if (integerConstant(insn) == 0) {
+		dst = Reg{x.operands[0].reg};
+		result = {ZeroIndex};
+	}
+	invalidate(insn, registers, commit);
+	if (dst.IsSet())
+		registers[dst] = result;
+	if (commit)
+		recordLocation(result, dst, spill);
+	if (spill) {
+		locals[spill] = result;
+		if (commit && function.IsAsync() && result.kind == NullValue && spill == -dart::kWordSize)
+			suspendState = true;
+		if (commit && result.kind == ContextValue) data.closureContextLocalOffset = spill;
+		if (commit && result.kind == TypeArgsValue) data.typeArgumentLocalOffset = spill;
+	}
+}
+
+bool X64ParameterRecovery::parameterMove(const cs_insn& insn, const Registers& registers)
+{
+	const auto& x = insn.detail->x86;
+	if (x.op_count != 2 || x.addr_size != dart::kWordSize)
+		return false;
+	const auto& dst = x.operands[0];
+	const auto& src = x.operands[1];
+	if (!isParameterValueMove(insn))
+		return false;
+	const auto input = source(src, registers, true);
+	// EmitFrameEntry initializes :suspend_state before InitSuspendableFunction
+	// so GC/exception handling can inspect it. This is real entry setup even
+	// with no surviving argument copies; it does not add a parameter.
+	const bool suspendInit = function.IsAsync() && input.kind == NullValue &&
+		isMemoryOperand(dst, X86_REG_RBP, -dart::kWordSize);
+	if (input.kind != ParameterValue && input.kind != IncomingValue && !suspendInit)
+		return false;
+	if (dst.type == X86_OP_REG)
+		return Reg{dst.reg}.IsSet() && !isVmStateRegister(Reg{dst.reg});
+	if (!isMemoryOperand(dst, X86_REG_RBP))
+		return false;
+	return dst.mem.disp < 0 && dst.mem.disp >= -frameSize && dst.mem.disp % dart::kWordSize == 0;
+}
+
+bool X64ParameterRecovery::parameterInstruction(const cs_insn& insn, const Registers& registers) const
+{
+	switch (insn.id) {
+	case X86_INS_MOV: case X86_INS_MOVABS: case X86_INS_MOVSD:
+	case X86_INS_MOVAPS: case X86_INS_MOVAPD: case X86_INS_MOVQ: case X86_INS_XCHG:
+	case X86_INS_XORPS: case X86_INS_XORPD: case X86_INS_LEA:
+	case X86_INS_ADD: case X86_INS_SUB: case X86_INS_SHL:
+	case X86_INS_SHR: case X86_INS_SAR: case X86_INS_XOR:
+	case X86_INS_AND: case X86_INS_OR:
+		break;
+	default:
+		return false;
+	}
+	const auto& x = insn.detail->x86;
+	if (x.addr_size != dart::kWordSize) return false;
+	for (unsigned i = 0; i < x.op_count; ++i) {
+		const auto& op = x.operands[i];
+		if (op.type != X86_OP_MEM) continue;
+		if (op.mem.segment != X86_REG_INVALID) return false;
+		if (op.access & CS_AC_WRITE) {
+			if (!isMemoryOperand(op, X86_REG_RBP) || op.mem.disp >= 0 ||
+				op.mem.disp < -frameSize || op.size != dart::kWordSize)
+				return false;
+			continue;
+		}
+		const Reg base{op.mem.base};
+		if (!base.IsSet()) return false;
+		if (base == Reg{Reg::RBP} || base == Reg{dart::THR} || base == Reg{dart::PP}) continue;
+		if (insn.id == X86_INS_MOVSD && op.size == 8 && registers[base].kind == NamedValue &&
+			isMemoryOperand(op, op.mem.base, dart::Double::value_offset() - dart::kHeapObjectTag))
+			continue;
+		if (registers[base].kind != Descriptor) return false;
+	}
+	return true;
+}
+
+std::unique_ptr<VarValue> X64ParameterRecovery::constant(const cs_x86_op& operand, bool unboxedDouble)
+{
+	if (operand.type == X86_OP_IMM) {
+		if ((operand.imm & dart::kSmiTagMask) == dart::kSmiTag)
+			return std::make_unique<VarInteger>(operand.imm, dart::kSmiCid);
+		return nullptr;
+	}
+	if (auto value = threadConstant(operand)) return value;
+	intptr_t offset;
+	if (!poolOffset(app, operand, offset))
+		return nullptr;
+	const auto index = PoolIndexFromOffset(offset);
+	const auto& pool = app.GetObjectPool();
+	if (index < 0 || index >= pool.Length())
+		return nullptr;
+	if (unboxedDouble) {
+		if (pool.TypeAt(index) != dart::ObjectPool::EntryType::kImmediate)
+			return nullptr;
+		const auto bits = pool.RawValueAt(index);
+		double value;
+		std::memcpy(&value, &bits, sizeof(value));
+		return std::make_unique<VarDouble>(value);
+	}
+	if (pool.TypeAt(index) != dart::ObjectPool::EntryType::kTaggedObject)
+		return nullptr;
+	const auto& object = dart::Object::Handle(pool.ObjectAt(index));
+	if (object.IsSmi())
+		return std::make_unique<VarInteger>(dart::RawSmiValue(dart::Smi::Cast(object).ptr()), dart::kSmiCid);
+	if (object.IsNull())
+		return std::make_unique<VarNull>();
+	if (object.IsString())
+		return std::make_unique<VarString>(dart::String::Cast(object).ToCString());
+	if (object.IsBool())
+		return std::make_unique<VarBoolean>(dart::Bool::Cast(object).value());
+	if (object.IsDouble())
+		return std::make_unique<VarDouble>(dart::Double::Cast(object).value());
+	// A default constant need not be primitive. Keep its actual snapshot
+	// representation without resolving functions or splitting aggregate stubs.
+	return std::make_unique<VarExpression>(object.ToCString(), object.GetClassId());
+}
+
+std::optional<std::string> X64ParameterRecovery::comparedName(
+	const cs_insn& insn, const Registers& registers)
+{
+	if (insn.id != X86_INS_CMP || insn.detail->x86.op_count != 2)
+		return std::nullopt;
+	if (insn.detail->x86.addr_size != dart::kWordSize)
+		return std::nullopt;
+	const auto* ops = insn.detail->x86.operands;
+	if (ops[0].size != dart::kWordSize || ops[1].size != dart::kWordSize)
+		return std::nullopt;
+	for (int i = 0; i < 2; ++i) {
+		const auto entry = source(ops[i], registers);
+		if (entry.kind != DescriptorName && !(entry.kind == Position && entry.value < 0)) continue;
+		auto value = constant(ops[1 - i]);
+		if (value && value->RawTypeId() == dart::kStringCid)
+			return static_cast<VarString*>(value.get())->str;
+	}
+	return std::nullopt;
+}
+
+bool X64ParameterRecovery::traceDefault(size_t index, DefaultPath& path)
+{
+	const auto& insn = *instructions.Ptr(index);
+	if (!parameterInstruction(insn, path.registers)) return false;
+	const auto& x = insn.detail->x86;
+	auto& defaults = path.defaults;
+	if (isRegisterSwap(insn)) {
+		std::swap(defaults[Reg{x.operands[0].reg}], defaults[Reg{x.operands[1].reg}]);
+	} else {
+		Reg destination;
+		DefaultConstant value;
+		if (isParameterValueMove(insn) && x.operands[0].type == X86_OP_REG) {
+			destination = Reg{x.operands[0].reg};
+			const auto& input = x.operands[1];
+			if (input.type == X86_OP_REG && Reg{input.reg}.IsSet())
+				value = std::move(defaults[Reg{input.reg}]);
+			else
+				value = {constant(input, insn.id == X86_INS_MOVSD), index + 1};
+		}
+		if (auto integer = integerConstant(insn)) {
+			destination = Reg{x.operands[0].reg};
+			value = {std::make_unique<VarInteger>(*integer, VarValue::NativeInt), index + 1};
+		}
+		// Only a paired supplied Double payload proves scalar interpretation.
+		if ((insn.id == X86_INS_XORPS || insn.id == X86_INS_XORPD) && x.op_count == 2 &&
+			isRegisterOfSize(x.operands[0], 16) && isRegisterOfSize(x.operands[1], 16) &&
+			x.operands[0].reg == x.operands[1].reg) {
+			destination = Reg{x.operands[0].reg};
+			value = {std::make_unique<VarDouble>(0.0), index + 1};
+		}
+		visitWrittenRegisters(insn, [&](Reg reg) { defaults[reg] = {}; });
+		if (destination.IsSet()) defaults[destination] = std::move(value);
+	}
+	transfer(insn, path.registers);
+	return true;
+}
+
+// PrologueBuilder increments optional_count_vars_processed even if optimization
+// eliminates the parameter value. Only a counter update remains on the matched
+// name arm. Continue with intersected sources, retaining raw IL and publishing
+// no parameter/default for the eliminated value.
+std::optional<X64ParameterRecovery::NamedResult> X64ParameterRecovery::unusedNamed(
+	size_t index, size_t join, const Registers& registers)
+{
+	if (join < index + 3 || join > index + 5 ||
+		!targets.HasOnlyIncoming(index + 2, join, {{join, index + 1}}))
+		return std::nullopt;
+	size_t next = index + 2;
+	const auto& add = *instructions.Ptr(next++);
+	const auto& op = add.detail->x86.operands;
+	if (add.id != X86_INS_ADD || add.detail->x86.op_count != 2 || !isRegisterOfSize(op[0], 8))
+		return std::nullopt;
+	const auto counter = op[0].reg;
+	if (isVmStateRegister(Reg{counter}) ||
+		(!isImmediateOperand(op[1], 1) && !isImmediateOperand(op[1], 2)))
+		return std::nullopt;
+	if (next < join && instructions.Ptr(next)->id == X86_INS_SAR) {
+		const auto& shift = instructions.Ptr(next++)->detail->x86;
+		if (op[1].imm != 2 || shift.op_count != 2 ||
+			!isRegisterOperand(shift.operands[0], counter) || !isImmediateOperand(shift.operands[1], 1))
+			return std::nullopt;
+	}
+	if (next < join) {
+		const auto& copy = *instructions.Ptr(next++);
+		const auto& x = copy.detail->x86;
+		if (copy.id != X86_INS_MOV || x.op_count != 2 || !isRegisterOfSize(x.operands[0], 8) ||
+			!isRegisterOperand(x.operands[1], counter) || isVmStateRegister(Reg{x.operands[0].reg}))
+			return std::nullopt;
+	}
+	if (next != join)
+		return std::nullopt;
+	NamedResult result;
+	result.join = join;
+	result.registers = registers;
+	for (size_t i = index + 2; i < join; ++i)
+		visitWrittenRegisters(*instructions.Ptr(i), [&](Reg reg) { result.registers[reg] = {}; });
+	return result;
+}
+
+// Reuse the ordinary Smi/Mint decoder; the proven argument source adds
+// identity, not a second machine pattern. Only its own JAE join is admitted.
+bool X64ParameterRecovery::unboxParameter(size_t& index, size_t end, Registers& registers,
+	std::vector<std::pair<size_t, size_t>>& edges)
+{
+#if !defined(DART_COMPRESSED_POINTERS)
+	InsnCursor cursor{instructions, targets, index};
+	auto unbox = readUnboxInt(cursor);
+	if (!unbox || cursor.Position() >= end)
+		return false;
+	const auto input = registers[unbox->srcObjReg];
+	if (input.kind != NamedValue)
+		return false;
+	edges.emplace_back(cursor.Position() + 1, cursor.Position() - 1);
+	for (size_t i = index; i <= cursor.Position(); ++i)
+		invalidate(*instructions.Ptr(i), registers, false);
+	registers[unbox->dstReg] = {UnboxedNamedValue, input.value};
+	index = cursor.Position();
+	return true;
+#else
+	return false;
+#endif
+}
+
+// PrologueBuilder links missing positional arguments through a shared default
+// tail; named arguments normally form single diamonds. Decode both using the
+// same source/default transfer rules. Only forward entry tests are admitted,
+// with complete instruction coverage and no undeclared incoming edges.
+std::vector<X64ParameterRecovery::NamedResult> X64ParameterRecovery::parameterDefaults(
+	size_t index, const Registers& registers)
+{
+	const LocalScope localScope{locals};
+	std::vector<DefaultPath> missing;
+	std::vector<std::pair<size_t, size_t>> edges;
+	auto supplied = registers;
+	Source count;
+	int firstOptional = -1;
+	size_t join = 0;
+	const auto limit = std::min(index + 64, instructions.Count());
+	std::array<bool, 64> visited{};
+	for (size_t i = index; i < limit; ++i) {
+		visited[i - index] = true;
+		if (!missing.empty() && i == missing.front().start) {
+			if (missing.size() != 1 || missing.front().optional >= 0) return {};
+			auto unused = unusedNamed(index, i, registers);
+			std::vector<NamedResult> result;
+			if (unused) result.push_back(std::move(*unused));
+			return result;
+		}
+		const auto& insn = *instructions.Ptr(i);
+		const auto& x = insn.detail->x86;
+		auto name = comparedName(insn, supplied);
+		if (name || (insn.id == X86_INS_CMP && x.op_count == 2)) {
+			int optional = -1;
+			if (name) {
+				if (!missing.empty()) return {};
+			} else {
+				const auto input = source(x.operands[0], supplied);
+				const auto& threshold = x.operands[1];
+				if (!isRegisterOfSize(x.operands[0], dart::kWordSize) || threshold.type != X86_OP_IMM ||
+					threshold.imm < 2 || threshold.imm > 2 * UINT8_MAX || (threshold.imm & 1)) return {};
+				optional = threshold.imm / 2 - 1;
+				if (missing.empty()) { count = input; firstOptional = optional; }
+				if ((count.kind != Count && count.kind != OptionalCount) || input != count ||
+					optional != firstOptional + static_cast<int>(missing.size())) return {};
+				name = std::format("optional_{}", optional);
+			}
+			if (i + 1 >= limit) return {};
+			const auto& branch = *instructions.Ptr(++i);
+			visited[i - index] = true;
+			const auto target = targets.Destination(branch);
+			if (branch.id != (optional < 0 ? X86_INS_JNE : X86_INS_JL) ||
+				!target || *target <= i + 1 || *target >= limit) return {};
+			missing.push_back({*target, supplied, *name, optional});
+			edges.emplace_back(*target, i);
+		} else if (insn.id == X86_INS_JMP) {
+			const auto target = targets.Destination(insn);
+			if (!target || *target <= i || *target >= limit) return {};
+			join = *target;
+			edges.emplace_back(join, i);
+			break;
+		} else {
+			if (missing.empty()) return {};
+			const auto begin = i;
+			if (!unboxParameter(i, limit, supplied, edges)) {
+				if (!parameterInstruction(insn, supplied)) return {};
+				transfer(insn, supplied);
+			}
+			std::fill(visited.begin() + (begin - index), visited.begin() + (i - index + 1), true);
+		}
+	}
+	if (missing.empty() || !join) return {};
+	for (auto& path : missing) {
+		locals = localScope.saved;
+		if (path.start >= join) return {};
+		for (size_t i = path.start; i < join; ++i) {
+			visited[i - index] = true;
+			const auto& insn = *instructions.Ptr(i);
+			if (insn.id == X86_INS_JMP) {
+				const auto target = targets.Destination(insn);
+				if (!target || *target <= i || *target > join) return {};
+				edges.emplace_back(*target, i);
+				i = *target - 1;
+			} else if (!traceDefault(i, path)) return {};
+		}
+	}
+	if (!targets.HasOnlyIncoming(index + 2, join, edges) ||
+		!std::all_of(visited.begin(), visited.begin() + (join - index), [](bool covered) { return covered; }))
+		return {};
+	return defaultResults(missing, supplied, join);
+}
+
+// A later missing path must preserve earlier supplied arguments. Earlier
+// missing paths must reach the exact same constant definition for later ones;
+// textual equality of rendered defaults is not sufficient evidence.
+std::vector<X64ParameterRecovery::NamedResult> X64ParameterRecovery::defaultResults(
+	std::vector<DefaultPath>& missing, const Registers& supplied, size_t join)
+{
+	std::vector<NamedResult> results(missing.size());
+	for (size_t k = 0; k < results.size(); ++k) {
+		auto& result = results[k];
+		result.join = join;
+		result.optional = missing[k].optional;
+		result.isNamed = result.optional < 0;
+		result.parameter.name = missing[k].name;
+		for (int r = 0; r < Reg::kNumberOfRegisters; ++r) {
+			bool unchanged = true;
+			for (const auto& path : missing) unchanged &= path.registers[r] == supplied[r];
+			if (unchanged) result.registers[r] = supplied[r];
+			const bool unboxed = supplied[r].kind == UnboxedNamedValue;
+			if ((supplied[r].kind != NamedValue && !unboxed) || supplied[r].value != result.optional ||
+				!missing[k].defaults[r].value) continue;
+			for (size_t path = 0; path < missing.size(); ++path) {
+				if (path > k ? missing[path].registers[r] != supplied[r] :
+					!missing[path].defaults[r].value || missing[path].defaults[r].origin != missing[k].defaults[r].origin) return {};
+			}
+			auto& value = missing[k].defaults[r].value;
+			if (value->RawTypeId() == dart::kIntegerCid) {
+				auto* integer = static_cast<VarInteger*>(value.get());
+				if (unboxed && integer->intTypeId != VarValue::NativeInt) return {};
+				if (!unboxed && integer->intTypeId == VarValue::NativeInt) {
+					if ((integer->val & dart::kSmiTagMask) != dart::kSmiTag) return {};
+					integer->intTypeId = dart::kSmiCid;
+				}
+			} else if (unboxed) return {};
+			result.parameter.valReg = Reg{static_cast<Reg::Value>(r)};
+			result.parameter.val = std::move(value);
+			result.locations.push_back(result.parameter.valReg);
+		}
+		if (!result.locations.empty()) continue;
+		// A name-presence flag is not a parameter: retain raw IL and continue.
+		const auto start = missing[k].start;
+		if (!result.isNamed || results.size() != 1 || start < 2 || join != start + 1) return {};
+		const auto& yes = *instructions.Ptr(start - 2);
+		const auto& no = *instructions.Ptr(start);
+		if (integerConstant(yes) != 1 || integerConstant(no) != 0 ||
+			Reg{yes.detail->x86.operands[0].reg} != Reg{no.detail->x86.operands[0].reg} ||
+			isVmStateRegister(Reg{yes.detail->x86.operands[0].reg})) return {};
+	}
+	return results;
+}
+
+std::optional<X64ParameterRecovery::NamedResult> X64ParameterRecovery::typeArguments(
+	size_t index, const Registers& registers)
+{
+	const auto& test = *instructions.Ptr(index);
+	const auto& x = test.detail->x86;
+	if (test.id != X86_INS_TEST || x.op_count != 2 || index + 1 >= instructions.Count())
+		return std::nullopt;
+	if (source(x.operands[0], registers).kind != TypeArgsLength)
+		return std::nullopt;
+	if (x.operands[0].type != X86_OP_REG || x.operands[1].type != X86_OP_REG ||
+		x.operands[0].reg != x.operands[1].reg)
+		return std::nullopt;
+	const auto& branch = *instructions.Ptr(index + 1);
+	if (branch.id != X86_INS_JNE)
+		return std::nullopt;
+	const auto supplied = targets.Destination(branch);
+	if (!supplied || *supplied <= index + 2 || *supplied - index > 8)
+		return std::nullopt;
+	const auto& jump = *instructions.Ptr(*supplied - 1);
+	if (jump.id != X86_INS_JMP)
+		return std::nullopt;
+	const auto join = targets.Destination(jump);
+	if (!join || *join <= *supplied || *join - *supplied > 8)
+		return std::nullopt;
+	if (!targets.HasOnlyIncoming(index + 2, *join,
+		{{*supplied, index + 1}, {*join, *supplied - 1}}))
+		return std::nullopt;
+	const LocalScope localScope{locals};
+	Registers absent = registers;
+	Reg nullRegister;
+	for (size_t i = index + 2; i < *supplied - 1; ++i) {
+		const auto& insn = *instructions.Ptr(i);
+		const auto& op = insn.detail->x86;
+		if (insn.id != X86_INS_MOV || op.op_count != 2 ||
+			!isRegisterOfSize(op.operands[0], dart::kWordSize))
+			return std::nullopt;
+		if (!isMemoryOperand(op.operands[1], CSREG_DART_THR, dart::Thread::object_null_offset()))
+			return std::nullopt;
+		nullRegister = Reg{op.operands[0].reg};
+		transfer(insn, absent);
+	}
+	auto present = registers;
+	for (size_t i = *supplied; i < *join; ++i) {
+		const auto& insn = *instructions.Ptr(i);
+		if (!parameterInstruction(insn, present)) return std::nullopt;
+		transfer(insn, present);
+	}
+	if (!nullRegister.IsSet() || present[nullRegister].kind != TypeArgsValue)
+		return std::nullopt;
+	NamedResult result;
+	result.join = *join;
+	for (int r = 0; r < Reg::kNumberOfRegisters; ++r)
+		if (present[r] == absent[r]) result.registers[r] = present[r];
+	result.registers[nullRegister] = {TypeArgsValue};
+	result.locations.push_back(nullRegister);
+	return result;
+}
+
+int X64ParameterRecovery::publish(FnParamInfo&& parameter, bool isNamed, int optional)
+{
+	if (hasDeclaration) {
+		for (size_t i = 0; i < data.params.params.size(); ++i) {
+			auto& known = data.params.params[i];
+			if (isNamed ? known.name != parameter.name : i != data.params.numFixedParam + optional)
+				continue;
+			known.valReg = parameter.valReg;
+			known.localOffset = parameter.localOffset;
+			known.val = std::move(parameter.val);
+			return i;
+		}
+		return -1;
+	}
+	data.params.isPartial = true;
+	data.params.isNamedParam = isNamed;
+	data.params.add(std::move(parameter));
+	return data.params.NumParam() - 1;
+}
+
+X64ParameterRecovery::Source X64ParameterRecovery::stackSource(int64_t offset, int countBias, int namedEntry)
+{
+	for (size_t i = 0; i < bindings.size(); ++i) {
+		const auto& binding = bindings[i];
+		const auto location = countBias < 0 && namedEntry < 0 ? binding.info.paramOffset : binding.indexedOffset;
+		if (binding.countBias == countBias && binding.namedEntry == namedEntry && location == offset)
+			return {IncomingValue, static_cast<int>(i)};
+	}
+	FnParamInfo info;
+	if (countBias < 0 && namedEntry < 0) info.paramOffset = offset;
+	info.name = namedEntry >= 0 ? std::format("named_slot_{}", namedEntry) :
+		countBias < 0 ? std::format("stack_{:#x}", offset) :
+		std::format("stack[(argc-{})*{}+{:#x}]", countBias, dart::kWordSize, offset);
+	bindings.push_back({std::move(info), false, -1, countBias, offset, namedEntry});
+	return {IncomingValue, static_cast<int>(bindings.size() - 1)};
+}
+
+void X64ParameterRecovery::bindIncoming(Registers& registers)
+{
+	auto bind = [&](Source& source) {
+		if (source.kind != IncomingValue)
+			return;
+		const auto index = bindings[source.value].parameter;
+		source = index >= 0 ? Source{ParameterValue, index} : Source{};
+	};
+	for (auto& source : registers) bind(source);
+	for (auto& [offset, source] : locals) bind(source);
+}
+
+void X64ParameterRecovery::finishIncoming(Registers& registers)
+{
+	if (!observingIncoming)
+		return;
+	observingIncoming = false;
+	for (size_t i = 0; i < bindings.size(); ++i) {
+		auto& binding = bindings[i];
+		if (!binding.observed)
+			continue;
+		auto& info = binding.info;
+		const Source owner{IncomingValue, static_cast<int>(i)};
+		if (info.valReg.IsSet() && registers[info.valReg] != owner)
+			info.valReg.Clear();
+		for (int reg = 0; !info.valReg.IsSet() && reg < Reg::kNumberOfRegisters; ++reg)
+			if (registers[reg] == owner) info.valReg = Reg{static_cast<Reg::Value>(reg)};
+		for (const auto& [offset, source] : locals)
+			if (source == owner && (!info.localOffset || offset > info.localOffset))
+				info.localOffset = offset;
+		if (receiver.IsSet() && info.paramReg == receiver) {
+			info.name = "this";
+			info.type = function.Class().DeclarationType();
+		}
+		if (!hasDeclaration) {
+			FnParamInfo parameter{info.valReg, info.localOffset, info.type, info.name, nullptr};
+			parameter.paramReg = info.paramReg;
+			parameter.paramOffset = info.paramOffset;
+			binding.parameter = receiver.IsSet() && info.paramReg == receiver ? receiverParameter : -1;
+			if (binding.parameter >= 0)
+				data.params[binding.parameter] = std::move(parameter);
+			else {
+				binding.parameter = data.params.NumParam();
+				if (binding.namedEntry >= 0) {
+					data.params.isNamedParam = true;
+					data.params.add(std::move(parameter));
+				} else data.params.addFixedParam(std::move(parameter));
+			}
+			data.params.isPartial = true;
+		}
+		data.incomingParameters.push_back(std::move(info));
+	}
+	bindIncoming(registers);
+}
+
+void X64ParameterRecovery::combine(size_t begin, size_t end)
+{
+	if (begin >= end || end >= instructions.Count())
+		return;
+	const auto start = instructions.Ptr(begin)->address;
+	const auto stop = instructions.Ptr(end)->address;
+	auto first = std::find_if(data.il_insns.begin(), data.il_insns.end(),
+		[&](const auto& il) { return il->Start() == start; });
+	if (first == data.il_insns.end())
+		return;
+	auto last = std::find_if(first, data.il_insns.end(),
+		[&](const auto& il) { return il->Start() == stop; });
+	if (last == data.il_insns.end())
+		return;
+	const auto index = first - data.il_insns.begin();
+	data.il_insns.erase(first, last);
+	data.il_insns.insert(data.il_insns.begin() + index,
+		std::make_unique<SetupParametersInstr>(AddrRange{start, stop}, &data.params));
+}
+
+// Named-argument counters may prevent the linear source pass from reaching
+// the generic-argument diamond. Its descriptor source can still be proven
+// independently: no call, no back edge, and no write to ARGS_DESC_REG before
+// an adjacent length-load / test. This does not interpret those counters.
+void X64ParameterRecovery::descriptorTypeArguments(size_t begin)
+{
+	if (data.typeArgumentReg.IsSet())
+		return;
+	size_t limit = begin;
+	while (limit < instructions.Count() && !isStackLimitCompare(*instructions.Ptr(limit)))
+		++limit;
+	if (limit == instructions.Count())
+		return;
+	for (size_t i = begin; i + 1 < limit; ++i) {
+		const auto& insn = *instructions.Ptr(i);
+		if (isTrap(insn))
+			return;
+		if (isControlTransfer(insn)) {
+			const auto target = targets.Destination(insn);
+			if (!isInGroup(&insn, CS_GRP_JUMP) || !target || *target <= i || *target > limit)
+				return;
+		}
+		bool writesDescriptor = false;
+		visitWrittenRegisters(insn, [&](Reg reg) { writesDescriptor |= reg == Reg{dart::ARGS_DESC_REG}; });
+		if (writesDescriptor)
+			return;
+		if (!isParameterValueMove(insn) || targets.contains(instructions.Ptr(i + 1)->address))
+			continue;
+		Registers registers{};
+		registers[Reg{dart::ARGS_DESC_REG}] = {Descriptor};
+		if (source(insn.detail->x86.operands[1], registers).kind != TypeArgsLength)
+			continue;
+		const LocalScope localScope{locals};
+		transfer(insn, registers);
+		if (auto result = typeArguments(i + 1, registers)) {
+			if (result->join > limit)
+				return;
+			data.typeArgumentReg = result->locations.front();
+			combine(i + 1, result->join);
+			return;
+		}
+	}
+}
+
+void X64ParameterRecovery::Recover()
+{
+	size_t begin = 0;
+	if (function.IsFfi())
+		return;
+	signature();
+	if (!readEntryFrame(instructions, targets, begin, frameSize))
+		return;
+	Registers registers{};
+	observingIncoming = function.Ptr() != dart::Function::null();
+	if (observingIncoming)
+		seedIncoming(registers);
+	registers[Reg{dart::ARGS_DESC_REG}] = {Descriptor};
+	for (int i = 0; i < data.params.NumParam(); ++i) {
+		const auto& parameter = data.params[i];
+		if (parameter.paramReg.IsSet()) registers[parameter.paramReg] = {ParameterValue, i};
+	}
+	std::optional<size_t> descriptorBegin;
+	std::optional<size_t> provenJoin;
+	size_t moveBegin = begin;
+	bool moving = false;
+	size_t i = begin;
+	// A retained arity identifies closure parameter zero exactly. Without it,
+	// the largest observed FP argument slot is only a partial convention hint.
+	for (; i < instructions.Count(); ++i) {
+		const auto& insn = *instructions.Ptr(i);
+		// Continue after our own verified diamond. An unrelated incoming edge
+		// still ends the linear source pass; the compound decoder proves join predecessors.
+		if (targets.contains(insn.address) && provenJoin != i)
+			break;
+		if (observingIncoming && endsParameterEntry(insn, targets))
+			finishIncoming(registers);
+		const bool move = !targets.contains(insn.address) && parameterMove(insn, registers);
+		if (moving && !move) combine(moveBegin, i);
+		if (!moving && move) moveBegin = i;
+		moving = move;
+		if (isStackLimitCompare(insn) || isTrap(insn))
+			break;
+		const auto& x = insn.detail->x86;
+		if (!descriptorBegin && x.op_count == 2 && insn.id == X86_INS_MOV) {
+			const auto input = source(x.operands[1], registers);
+			if (input.kind == Count || input.kind == TypeArgsLength || input.kind == Descriptor)
+				descriptorBegin = i;
+		}
+		auto result = typeArguments(i, registers);
+		const bool generic = result.has_value();
+		std::vector<NamedResult> results;
+		if (result) results.push_back(std::move(*result));
+		else results = parameterDefaults(i, registers);
+		if (!results.empty()) {
+			finishIncoming(registers);
+			registers = results.front().registers;
+			bindIncoming(registers);
+			bool published = generic;
+			for (auto& recovered : results) {
+				int parameter = -1;
+				if (generic) data.typeArgumentReg = recovered.locations.front();
+				else if (!recovered.locations.empty())
+					parameter = publish(std::move(recovered.parameter), recovered.isNamed, recovered.optional);
+				if (parameter >= 0) for (auto location : recovered.locations)
+					registers[location] = {ParameterValue, parameter};
+				published |= parameter >= 0;
+			}
+			const auto join = results.front().join;
+			if (published) combine(i, join);
+			provenJoin = join;
+			descriptorBegin = join;
+			i = join - 1;
+			moving = false;
+			continue;
+		}
+		if (isControlTransfer(insn))
+			break;
+		if (descriptorBegin && !parameterInstruction(insn, registers))
+			break;
+		transfer(insn, registers, true);
+		if (x.op_count == 2 && x.operands[0].type == X86_OP_REG) {
+			const Reg destination{x.operands[0].reg};
+			if (destination.IsSet() && registers[destination].kind == TypeArgsValue)
+				data.typeArgumentReg = destination;
+			if (destination.IsSet() && registers[destination].kind == ContextValue)
+				data.closureContextReg = destination;
+		}
+		if (hasDeclaration && function.IsClosure() && insn.id == X86_INS_MOV && x.op_count == 2 &&
+			isRegisterOfSize(x.operands[0], dart::kWordSize) &&
+			isMemoryOperand(x.operands[1], X86_REG_RBP, function.FirstParamOffset()))
+			registers[Reg{x.operands[0].reg}] = {ClosureValue};
+	}
+	finishIncoming(registers);
+	if (moving) combine(moveBegin, i);
+	descriptorTypeArguments(begin);
+}
+
+}
+
 const FunctionAnalyzer::Matcher FunctionAnalyzer::matcherFns[] = {
 	&FunctionAnalyzer::processGdtCallInstr,
 	&FunctionAnalyzer::processEnterFrameInstr,
@@ -2210,6 +3367,7 @@ void FunctionAnalyzer::asm2il()
 		emit(std::move(il), i, end);
 		i = end;
 	}
+	X64ParameterRecovery{app, function, data, instructions, targets}.Recover();
 }
 
 } // namespace

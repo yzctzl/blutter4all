@@ -186,12 +186,16 @@ std::string FnParamInfo::ToString() const
 		txt += " = ";
 		txt += val->ToString();
 	}
-	if (valReg.IsSet() || localOffset) {
+	if (paramReg.IsSet() || paramOffset || valReg.IsSet() || localOffset) {
 		txt += " /* ";
 		if (paramReg.IsSet()) {
 			txt += paramReg.Name();
-			txt += " => ";
 		}
+		else if (paramOffset) {
+			txt += std::format("fp+{:#x}", paramOffset);
+		}
+		if ((paramReg.IsSet() || paramOffset) && (valReg.IsSet() || localOffset))
+			txt += " => ";
 		if (valReg.IsSet()) {
 			txt += valReg.Name();
 			if (localOffset)
@@ -240,5 +244,5 @@ std::string FnParams::ToString() const
 	if (numFixedParam < params.size())
 		txt += isNamedParam ? '}' : ']';
 
-	return txt;
+	return isPartial ? txt + " /* partial */" : txt;
 }

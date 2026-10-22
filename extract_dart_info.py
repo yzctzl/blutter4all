@@ -35,20 +35,20 @@ def extract_snapshot_hash_flags(libapp_file):
     
     return snapshot_hash, flags
 
-def extract_libflutter_info(libflutter_file):
+def extract_libflutter_info(libflutter_file, target_arch=None):
     if is_macho(libflutter_file):
-        image = MachO(libflutter_file)
+        image = MachO(libflutter_file, target_arch)
         data = image.data.tobytes()
         versions = {match[0].decode() for match in re.findall(br'\x00([\d\w\.-]+) \((stable|beta|dev)\)', data)}
         if len(versions) > 1:
             raise ValueError('Ambiguous Dart versions in selected Flutter engine slice')
         hashes = re.findall(br'\x00([a-f\d]{40})(?=\x00)', data)
-        return [value.decode() for value in hashes], next(iter(versions), None), 'arm64', image.platform
+        return [value.decode() for value in hashes], next(iter(versions), None), image.arch, image.platform
     with open(libflutter_file, 'rb') as f:
         elf = ELFFile(f)
         if elf.header.e_machine == 'EM_AARCH64': # 183
             arch = 'arm64'
-        elif elf.header.e_machine == 'EM_IA_64': # 50
+        elif elf.header.e_machine == 'EM_X86_64': # 62
             arch = 'x64'
         else:
             assert False, f"Unsupport architecture: {elf.header.e_machine}"
@@ -117,18 +117,53 @@ def get_dart_commit(url):
     # TODO: if no revision and version in first 4096 bytes, get the file location from the first zip dir entries at the end of file (less than 256KB)
     return commit_id, dart_version
 
-def extract_dart_info(libapp_file: str, libflutter_file: str):
+def extract_dart_info(libapp_file: str, libflutter_file: str, target_arch=None):
     apple = is_macho(libapp_file)
     if apple != is_macho(libflutter_file):
         raise ValueError('App and Flutter engine formats do not match')
     if apple:
-        snapshot_hash, flags, snapshot_os = MachO(libapp_file).snapshot_info()
+        image = MachO(libapp_file, target_arch)
+        snapshot_hash, flags, snapshot_os = image.snapshot_info()
+        target_arch = image.arch
     else:
         snapshot_hash, flags = extract_snapshot_hash_flags(libapp_file)
     #print('snapshot hash', snapshot_hash)
     #print(flags)
 
-    engine_ids, dart_version, arch, os_name = extract_libflutter_info(libflutter_file)
+    if not apple:
+        architectures = [value for value in ('arm64', 'x64') if value in flags]
+        platforms = [value for value in ('android', 'linux', 'windows') if value in flags]
+        if len(architectures) != 1 or len(platforms) != 1:
+            raise ValueError('Missing or ambiguous snapshot architecture/platform')
+        arch, os_name = architectures[0], platforms[0]
+        if target_arch not in (None, arch):
+            raise ValueError('Requested architecture does not match snapshot')
+        with open(libapp_file, 'rb') as stream:
+            machine = ELFFile(stream).header.e_machine
+        if machine != {'arm64': 'EM_AARCH64', 'x64': 'EM_X86_64'}[arch]:
+            raise ValueError('Snapshot architecture does not match ELF header')
+        if os_name == 'windows':
+            # The engine is PE even when its AOT payload is ELF. Read only
+            # embedded SDK metadata; no PE snapshot loading or execution.
+            with open(libflutter_file, 'rb') as stream:
+                engine_data = stream.read()
+            if len(engine_data) < 64 or not engine_data.startswith(b'MZ'):
+                raise ValueError('Expected Windows Flutter engine')
+            pe_offset, = unpack('<I', engine_data[60:64])
+            if (pe_offset > len(engine_data) - 6 or engine_data[pe_offset:pe_offset+4] != b'PE\0\0' or
+                    unpack('<H', engine_data[pe_offset+4:pe_offset+6])[0] != {'x64': 0x8664, 'arm64': 0xaa64}[arch]):
+                raise ValueError('App and Windows Flutter engine architectures do not match')
+            versions = {match[0].decode() for match in re.findall(br'\x00([\d\w.-]+) \((stable|beta|dev)\)', engine_data)}
+            if len(versions) != 1:
+                raise ValueError('Cannot determine unique Dart version from Windows engine')
+            dart_version = versions.pop()
+            engine_ids = []
+        else:
+            engine_ids, dart_version, engine_arch, _ = extract_libflutter_info(libflutter_file)
+            if arch != engine_arch:
+                raise ValueError('App and Flutter engine architectures do not match')
+    else:
+        engine_ids, dart_version, arch, os_name = extract_libflutter_info(libflutter_file, target_arch)
     if apple:
         if os_name not in (None, snapshot_os):
             raise ValueError('App and Flutter engine target platforms do not match')
@@ -149,7 +184,6 @@ def extract_dart_info(libapp_file: str, libflutter_file: str):
         # print(dart_version)
         #assert dart_version == dart_version_sdk
     
-    # TODO: os (android or ios) and architecture (arm64 or x64)
     return dart_version, snapshot_hash, flags, arch, os_name
 
 

@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "ObjectPool.h"
 #include "VarValue.h"
 #include <sstream>
 
@@ -16,7 +17,7 @@ std::string VarStorage::Name()
 	case Static:
 		return std::format("static_{:x}", offset);
 	case Pool:
-		return std::format("PP_{:x}", offset);
+		return std::format("PP_{:x}", PoolInstructionOffset(offset));
 	case Thread:
 		return std::format("THR_{:x}", offset);
 	case SmallImm:

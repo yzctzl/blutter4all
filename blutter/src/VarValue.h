@@ -20,12 +20,12 @@ struct VarStorage {
 		Field, // access field
 		Uninit,
 	};
-	VarStorage(A64::Register reg) : kind{ Register }, reg{ reg } {}
+	VarStorage(CpuRegister reg) : kind{ Register }, reg{ reg } {}
 	VarStorage(Kind kind) : kind{ kind }, offset{ 0 } {}
 	VarStorage(Kind kind, int val) : kind{ kind }, offset{ val } {}
 
 	static VarStorage NewExpression() { return VarStorage(Expression); }
-	static VarStorage NewRegister(A64::Register reg) { return VarStorage(reg); }
+	static VarStorage NewRegister(CpuRegister reg) { return VarStorage(reg); }
 	static VarStorage NewLocal(int offset) { return VarStorage(Local, offset); }
 	static VarStorage NewArgument(int idx) { return VarStorage(Argument, idx); }
 	static VarStorage NewStatic(int offset) { return VarStorage(Static, offset); }
@@ -36,7 +36,7 @@ struct VarStorage {
 	static VarStorage NewCall() { return VarStorage(Call); }
 	static VarStorage NewUninit() { return VarStorage(Uninit); }
 
-	bool operator==(A64::Register reg) const { return kind == Register && reg == this->reg; }
+	bool operator==(CpuRegister reg) const { return kind == Register && reg == this->reg; }
 	bool IsImmediate() const { return kind == Immediate; }
 	bool IsPredefinedValue() const { return kind == Immediate || kind == Pool; }
 
@@ -44,7 +44,7 @@ struct VarStorage {
 
 	Kind kind;
 	union {
-		A64::Register reg;
+		CpuRegister reg;
 		int offset; // offset of Local, Pool, Thread, Offset
 		int idx; // index of Argument
 	};
@@ -300,8 +300,8 @@ struct VarItem {
 	explicit VarItem(VarStorage storage, std::unique_ptr<VarValue> val) : storage(storage), val(std::move(val)) {}
 	explicit VarItem(VarStorage storage, VarValue* val) : storage(storage), val(std::unique_ptr<VarValue>(val)) {}
 	// register storage is common and also special type
-	explicit VarItem(A64::Register reg, std::unique_ptr<VarValue> val) : storage(VarStorage(reg)), val(std::move(val)) {}
-	explicit VarItem(A64::Register reg, VarValue* val) : storage(VarStorage(reg)), val(std::unique_ptr<VarValue>(val)) {}
+	explicit VarItem(CpuRegister reg, std::unique_ptr<VarValue> val) : storage(VarStorage(reg)), val(std::move(val)) {}
+	explicit VarItem(CpuRegister reg, VarValue* val) : storage(VarStorage(reg)), val(std::unique_ptr<VarValue>(val)) {}
 
 	VarStorage Storage() const { return storage; }
 	std::string StorageName() { return storage.Name(); }
@@ -313,7 +313,7 @@ struct VarItem {
 	std::string ValueString() const { return val ? val->ToString() : "BUG_NO_ASSIGN_VALUE"; }
 	ValueType ValueTypeId() const { return val->RawTypeId(); }
 	VarItem* MoveTo(VarStorage storage) { return new VarItem(storage, std::move(val)); }
-	VarItem* MoveTo(A64::Register reg) { return new VarItem(VarStorage::NewRegister(reg), std::move(val)); }
+	VarItem* MoveTo(CpuRegister reg) { return new VarItem(VarStorage::NewRegister(reg), std::move(val)); }
 
 	// TODO: more clever name or value when it is known type
 	std::string Name();

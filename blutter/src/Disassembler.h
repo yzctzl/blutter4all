@@ -1,8 +1,26 @@
 #pragma once
 #include <capstone.h>
 #include <utility>
+#include <algorithm>
+#include <stdexcept>
+struct AddrRange {
+	uint64_t start{ 0 };
+	uint64_t end{ 0 };
+
+	AddrRange() = default;
+	AddrRange(uint64_t start, uint64_t end) : start{ start }, end{ end } {}
+
+	bool Has(uint64_t addr) const { return addr >= start && addr < end; }
+};
+
 #ifdef TARGET_ARCH_ARM64
 #include "Disassembler_arm64.h"
+using CpuRegister = A64::Register;
+#elif defined(TARGET_ARCH_X64)
+#include "Disassembler_x64.h"
+using CpuRegister = X64::Register;
+#else
+#error Unsupported target architecture
 #endif
 
 
@@ -31,25 +49,14 @@ public:
 	AsmInstruction At(size_t i) { return AsmInstruction(insns + i); }
 	cs_insn* Ptr(size_t i) { return &insns[i]; }
 	size_t AtIndex(uint64_t addr) {
-		ASSERT(addr > insns->address);
-		// estimate index (normally 4 bytes per instruction for arm64)
-		auto idx = (addr - insns->address) / 4;
-		ASSERT(idx < count);
-		while (idx < count && insns[idx].address < addr)
-			++idx;
-		return idx;
+		auto it = std::lower_bound(insns, insns + count, addr,
+			[](const cs_insn& insn, uint64_t address) { return insn.address < address; });
+		if (it == insns + count || it->address != addr)
+			throw std::out_of_range("Address is not an instruction boundary");
+		return it - insns;
 	}
-	AsmInstruction AtAddr(uint64_t addr) {
-		ASSERT(addr > insns->address);
-		// estimate index (normally 4 bytes per instruction for arm64)
-		auto idx = (addr - insns->address) / 4;
-		ASSERT(idx < count);
-		auto insn = &insns[idx];
-		while (insn->address < addr)
-			++insn;
-		ASSERT(insn->address == addr);
-		return AsmInstruction(insn);
-	}
+	AsmInstruction AtAddr(uint64_t addr) { return At(AtIndex(addr)); }
+
 
 	friend class Disassembler;
 	friend class Instruction;
@@ -89,7 +96,7 @@ public:
 	Disassembler& operator=(const Disassembler&) = delete;
 
 	AsmInstructions Disasm(const uint8_t* code, size_t code_size, uint64_t address, size_t max_count = 0);
-	const char* GetRegName(arm64_reg reg) { return cs_reg_name(cshandle, reg); }
+	const char* GetRegName(unsigned int reg) { return cs_reg_name(cshandle, reg); }
 
 private:
 	csh cshandle;

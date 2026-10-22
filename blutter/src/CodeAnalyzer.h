@@ -7,6 +7,8 @@
 class DartApp;
 class DartFunction;
 
+VarValue* getPoolObject(DartApp& app, intptr_t offset, CpuRegister dstReg);
+
 struct AsmText {
 	enum DataType : uint8_t {
 		None,
@@ -17,7 +19,12 @@ struct AsmText {
 	};
 
 	uint64_t addr;
-	char text[71]; // first 16 bytes are for mnemonic and spaces, after that is operands
+	// First 16 bytes hold the mnemonic; x64 operands can be longer.
+#if defined(TARGET_ARCH_X64)
+	char text[176]; // Capstone op_str is at most 160 bytes including NUL.
+#else
+	char text[71];
+#endif
 	uint8_t dataType;
 	union {
 		uint64_t threadOffset;
@@ -36,13 +43,11 @@ public:
 	std::vector<AsmText>& Data() { return asm_texts; }
 
 	size_t AtIndex(uint64_t addr) {
-		ASSERT(addr >= first_addr && addr <= last_addr);
-		// TODO: below is specific to arm64
-		// estimate index (normally 4 bytes per instruction for arm64)
-		auto idx = (addr - first_addr) / 4;
-		while (asm_texts[idx].addr < addr)
-			++idx;
-		return idx;
+		auto it = std::lower_bound(asm_texts.begin(), asm_texts.end(), addr,
+			[](const AsmText& text, uint64_t address) { return text.addr < address; });
+		if (it == asm_texts.end() || it->addr != addr)
+			throw std::out_of_range("Address is not an instruction boundary");
+		return it - asm_texts.begin();
 	}
 
 	AsmText& AtAddr(uint64_t addr) { return asm_texts[AtIndex(addr)]; }
@@ -60,22 +65,22 @@ private:
 };
 
 struct FnParamInfo {
-	A64::Register paramReg; // when parameter is passed with register
+	CpuRegister paramReg; // when parameter is passed with register
 	int32_t paramOffset{ 0 }; // offset from FP (first param offset is 0x10. if it is optional param, value is 0)
-	A64::Register valReg;
+	CpuRegister valReg;
 	int32_t localOffset{ 0 }; // offset from FP (local variable)
 	DartType* type{ nullptr };
 	std::string name;
 	std::unique_ptr<VarValue> val;
 
 	explicit FnParamInfo() {}
-	explicit FnParamInfo(A64::Register paramReg, A64::Register valReg, int32_t localOffset) : paramReg(paramReg), valReg(valReg), localOffset(localOffset) {}
-	explicit FnParamInfo(A64::Register valReg) : valReg(valReg) {}
-	explicit FnParamInfo(A64::Register valReg, int32_t localOffset) : valReg(valReg), localOffset(localOffset) {}
-	explicit FnParamInfo(A64::Register valReg, std::unique_ptr<VarValue> val) : valReg(valReg), val(std::move(val)) {}
-	explicit FnParamInfo(A64::Register valReg, int32_t localOffset, DartType* type, std::string name, std::unique_ptr<VarValue> val)
+	explicit FnParamInfo(CpuRegister paramReg, CpuRegister valReg, int32_t localOffset) : paramReg(paramReg), valReg(valReg), localOffset(localOffset) {}
+	explicit FnParamInfo(CpuRegister valReg) : valReg(valReg) {}
+	explicit FnParamInfo(CpuRegister valReg, int32_t localOffset) : valReg(valReg), localOffset(localOffset) {}
+	explicit FnParamInfo(CpuRegister valReg, std::unique_ptr<VarValue> val) : valReg(valReg), val(std::move(val)) {}
+	explicit FnParamInfo(CpuRegister valReg, int32_t localOffset, DartType* type, std::string name, std::unique_ptr<VarValue> val)
 		: valReg(valReg), localOffset(localOffset), type(type), name(std::move(name)), val(std::move(val)) {}
-	explicit FnParamInfo(A64::Register valReg, std::string name) : valReg(valReg), name(std::move(name)) {}
+	explicit FnParamInfo(CpuRegister valReg, std::string name) : valReg(valReg), name(std::move(name)) {}
 	explicit FnParamInfo(std::string name) : name(std::move(name)) {}
 
 	std::string ToString() const;
@@ -90,8 +95,8 @@ struct FnParams {
 	FnParamInfo& back() { return params.back(); }
 	FnParamInfo& operator[](int i) { return params[i]; }
 
-	FnParamInfo* findValReg(A64::Register reg);
-	bool movValReg(A64::Register dstReg, A64::Register srcReg);
+	FnParamInfo* findValReg(CpuRegister reg);
+	bool movValReg(CpuRegister dstReg, CpuRegister srcReg);
 	std::string ToString() const;
 
 	uint8_t numFixedParam{ 0 };
@@ -103,9 +108,9 @@ class AnalyzingState {
 public:
 	AnalyzingState(uint32_t stackSize) : local_vars{ stackSize / sizeof(void*), nullptr } { regs.fill(nullptr); }
 
-	void SetRegister(A64::Register reg, VarValue* val) { regs[reg] = val; }
-	void ClearRegister(A64::Register reg) { regs[reg] = nullptr; }
-	VarValue* MoveRegister(A64::Register dstReg, A64::Register srcReg) {
+	void SetRegister(CpuRegister reg, VarValue* val) { regs[reg] = val; }
+	void ClearRegister(CpuRegister reg) { regs[reg] = nullptr; }
+	VarValue* MoveRegister(CpuRegister dstReg, CpuRegister srcReg) {
 		auto val = regs[srcReg];
 		if (dstReg != srcReg) {
 			regs[dstReg] = val;
@@ -113,7 +118,7 @@ public:
 		}
 		return val;
 	}
-	VarValue* GetValue(A64::Register reg) { return regs[reg]; }
+	VarValue* GetValue(CpuRegister reg) { return regs[reg]; }
 
 	static int localOffsetToIndex(int offset) { ASSERT(offset < 0);  return (-offset - sizeof(void*)) / sizeof(void*); }
 	static int indexToLocalOffset(int idx) { return -(idx + 1) * sizeof(void*); }
@@ -122,7 +127,7 @@ public:
 
 //private:
 	// variable storage. only reference here.
-	std::array<VarValue*, A64::Register::kNumberOfRegisters> regs;
+	std::array<VarValue*, CpuRegister::kNumberOfRegisters> regs;
 	std::vector<VarValue*> local_vars;
 	std::vector<VarValue*> callee_args;
 };
@@ -182,10 +187,10 @@ public:
 
 	//int firstParamOffset{ 0 };
 	// TODO: initialization list in prologue, type argument (from ArgumentsDescriptor or Closure)
-	A64::Register closureContextReg;
+	CpuRegister closureContextReg;
 	int32_t closureContextLocalOffset{ 0 }; // offset from FP (local variable)
 	// type argument from ArgumentsDescriptor
-	A64::Register typeArgumentReg;
+	CpuRegister typeArgumentReg;
 	int32_t typeArgumentLocalOffset{ 0 };
 
 	void InitState() { state = std::make_unique<AnalyzingState>(stackSize); }

@@ -1,4 +1,4 @@
-"""Bounded metadata reads for ordinary ARM64 Apple snapshot dylibs/engines.
+"""Bounded metadata reads for ARM64/x64 Apple snapshot dylibs/engines.
 
 No native loading: offsets are relative to the selected universal slice.
 The C++ mapper owns the VM image; this reader only discovers build metadata.
@@ -22,7 +22,9 @@ def require(condition, message):
 
 
 class MachO:
-    def __init__(self, path):
+    def __init__(self, path, arch=None):
+        require(arch in (None, "arm64", "x64"), "Unsupported architecture")
+        requested_arch = arch
         with open(path, 'rb') as stream:
             self.data = memoryview(stream.read())
         if self.read(0, 4) == b'\xca\xfe\xba\xbe':
@@ -35,14 +37,16 @@ class MachO:
                 require(offset >= table_end and size > 0 and alignment < 32 and
                         offset % (1 << alignment) == 0, 'Invalid universal slice')
                 image = self.read(offset, size)
-                if cpu == 0x100000c and subtype & 0xffffff == 0:
-                    require(selected is None, 'Ambiguous ordinary ARM64 slices')
+                if (cpu, subtype & 0xffffff) == ({'arm64': (0x100000c, 0), 'x64': (0x1000007, 3)}[arch or 'arm64']):
+                    require(selected is None, 'Ambiguous target architecture slices')
                     selected = image
-            require(selected is not None, 'No ordinary ARM64 slice')
+            require(selected is not None, 'No matching target architecture slice')
             self.data = selected
         magic, cpu, subtype, filetype, count, size, _, _ = self.unpack('<8I', 0)
-        require(magic == 0xfeedfacf and cpu == 0x100000c and subtype & 0xffffff == 0,
-                'Expected little-endian ordinary ARM64 (arm64e is deferred)')
+        require(magic == 0xfeedfacf, 'Expected little-endian Mach-O 64')
+        self.arch = {(0x100000c, 0): 'arm64', (0x1000007, 3): 'x64'}.get((cpu, subtype & 0xffffff))
+        require(self.arch is not None, 'Expected ordinary ARM64 or x64 (arm64e is deferred)')
+        require(requested_arch in (None, self.arch), 'Requested architecture does not match image')
         require(filetype == 6, 'Expected dynamic library')
         self.read(32, size)
         require(count <= size // 8, 'Invalid load command count')
@@ -123,7 +127,7 @@ class MachO:
         end = flags.find(b'\0')
         require(end >= 0, 'Unterminated snapshot flags')
         flags = flags[:end].decode('ascii').split()
-        require('arm64' in flags, 'Snapshot architecture does not match image')
+        require(self.arch in flags, 'Snapshot architecture does not match image')
         platforms = [value for value in ('ios', 'macos') if value in flags]
         require(len(platforms) == 1, 'Missing or ambiguous snapshot platform')
         require(self.platform in (None, platforms[0]), 'Snapshot platform does not match image')

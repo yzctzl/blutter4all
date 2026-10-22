@@ -136,7 +136,7 @@ protected:
 
 class MoveRegInstr : public ILInstr {
 public:
-	MoveRegInstr(AddrRange addrRange, A64::Register dstReg, A64::Register srcReg) : ILInstr(MoveReg, addrRange), dstReg(dstReg), srcReg(srcReg) {}
+	MoveRegInstr(AddrRange addrRange, CpuRegister dstReg, CpuRegister srcReg) : ILInstr(MoveReg, addrRange), dstReg(dstReg), srcReg(srcReg) {}
 	MoveRegInstr() = delete;
 	MoveRegInstr(MoveRegInstr&&) = delete;
 	MoveRegInstr& operator=(const MoveRegInstr&) = delete;
@@ -145,8 +145,8 @@ public:
 		return std::format("{} = {}", dstReg.Name(), srcReg.Name());
 	}
 
-	A64::Register dstReg;
-	A64::Register srcReg;
+	CpuRegister dstReg;
+	CpuRegister srcReg;
 };
 
 class CallLeafRuntimeInstr : public ILInstr {
@@ -166,7 +166,7 @@ public:
 
 class LoadValueInstr : public ILInstr {
 public:
-	LoadValueInstr(AddrRange addrRange, A64::Register dstReg, VarItem val) : ILInstr(LoadValue, addrRange), dstReg(dstReg), val(std::move(val)) {}
+	LoadValueInstr(AddrRange addrRange, CpuRegister dstReg, VarItem val) : ILInstr(LoadValue, addrRange), dstReg(dstReg), val(std::move(val)) {}
 	LoadValueInstr() = delete;
 	LoadValueInstr(LoadValueInstr&&) = delete;
 	LoadValueInstr& operator=(const LoadValueInstr&) = delete;
@@ -179,13 +179,13 @@ public:
 		return val;
 	}
 
-	A64::Register dstReg;
+	CpuRegister dstReg;
 	VarItem val;
 };
 
 class StoreObjectPoolInstr : public ILInstr {
 public:
-	StoreObjectPoolInstr(AddrRange addrRange, A64::Register srcReg, int64_t offset) : ILInstr(LoadValue, addrRange), srcReg(srcReg), offset(offset) {}
+	StoreObjectPoolInstr(AddrRange addrRange, CpuRegister srcReg, int64_t offset) : ILInstr(LoadValue, addrRange), srcReg(srcReg), offset(offset) {}
 	StoreObjectPoolInstr() = delete;
 	StoreObjectPoolInstr(StoreObjectPoolInstr&&) = delete;
 	StoreObjectPoolInstr& operator=(const StoreObjectPoolInstr&) = delete;
@@ -194,7 +194,7 @@ public:
 		return std::format("[PP+{:#x}] = {}", offset, srcReg.Name());
 	}
 
-	A64::Register srcReg;
+	CpuRegister srcReg;
 	int64_t offset;
 };
 
@@ -230,7 +230,7 @@ protected:
 
 class SaveRegisterInstr : public ILInstr {
 public:
-	SaveRegisterInstr(AddrRange addrRange, A64::Register srcReg) : ILInstr(SaveRegister, addrRange), srcReg(srcReg) {}
+	SaveRegisterInstr(AddrRange addrRange, CpuRegister srcReg) : ILInstr(SaveRegister, addrRange), srcReg(srcReg) {}
 	SaveRegisterInstr() = delete;
 	SaveRegisterInstr(SaveRegisterInstr&&) = delete;
 	SaveRegisterInstr& operator=(const SaveRegisterInstr&) = delete;
@@ -240,12 +240,12 @@ public:
 	}
 
 protected:
-	A64::Register srcReg;
+	CpuRegister srcReg;
 };
 
 class RestoreRegisterInstr : public ILInstr {
 public:
-	RestoreRegisterInstr(AddrRange addrRange, A64::Register dstReg) : ILInstr(RestoreRegister, addrRange), dstReg(dstReg) {}
+	RestoreRegisterInstr(AddrRange addrRange, CpuRegister dstReg) : ILInstr(RestoreRegister, addrRange), dstReg(dstReg) {}
 	RestoreRegisterInstr() = delete;
 	RestoreRegisterInstr(RestoreRegisterInstr&&) = delete;
 	RestoreRegisterInstr& operator=(const RestoreRegisterInstr&) = delete;
@@ -255,7 +255,7 @@ public:
 	}
 
 protected:
-	A64::Register dstReg;
+	CpuRegister dstReg;
 };
 
 class SetupParametersInstr : public ILInstr {
@@ -309,8 +309,8 @@ public:
 
 	virtual std::string ToString() {
 		if (fnBase != nullptr)
-			return std::format("r0 = {}()", fnBase->Name());
-		return std::format("r0 = call {:#x}", addr);
+			return std::format("{} = {}()", CpuRegister{dart::CallingConventions::kReturnReg}.Name(), fnBase->Name());
+		return std::format("{} = call {:#x}", CpuRegister{dart::CallingConventions::kReturnReg}.Name(), addr);
 	}
 
 	DartFnBase* GetFunction() {
@@ -340,7 +340,7 @@ public:
 
 class BranchIfSmiInstr : public ILInstr {
 public:
-	BranchIfSmiInstr(AddrRange addrRange, A64::Register objReg, int64_t branchAddr) : ILInstr(BranchIfSmi, addrRange), objReg(objReg), branchAddr(branchAddr) {}
+	BranchIfSmiInstr(AddrRange addrRange, CpuRegister objReg, int64_t branchAddr) : ILInstr(BranchIfSmi, addrRange), objReg(objReg), branchAddr(branchAddr) {}
 	BranchIfSmiInstr() = delete;
 	BranchIfSmiInstr(BranchIfSmiInstr&&) = delete;
 	BranchIfSmiInstr& operator=(const BranchIfSmiInstr&) = delete;
@@ -349,13 +349,13 @@ public:
 		return std::format("branchIfSmi({}, {:#x})", objReg.Name(), branchAddr);
 	}
 
-	A64::Register objReg;
+	CpuRegister objReg;
 	int64_t branchAddr;
 };
 
 class LoadClassIdInstr : public ILInstr {
 public:
-	LoadClassIdInstr(AddrRange addrRange, A64::Register objReg, A64::Register cidReg) : ILInstr(LoadClassId, addrRange), objReg(objReg), cidReg(cidReg) {}
+	LoadClassIdInstr(AddrRange addrRange, CpuRegister objReg, CpuRegister cidReg) : ILInstr(LoadClassId, addrRange), objReg(objReg), cidReg(cidReg) {}
 	LoadClassIdInstr() = delete;
 	LoadClassIdInstr(LoadClassIdInstr&&) = delete;
 	LoadClassIdInstr& operator=(const LoadClassIdInstr&) = delete;
@@ -364,8 +364,8 @@ public:
 		return std::format("{} = LoadClassIdInstr({})", cidReg.Name(), objReg.Name());
 	}
 
-	A64::Register objReg;
-	A64::Register cidReg;
+	CpuRegister objReg;
+	CpuRegister cidReg;
 };
 
 class LoadTaggedClassIdMayBeSmiInstr : public ILInstr {
@@ -382,8 +382,8 @@ public:
 		return std::format("{} = LoadTaggedClassIdMayBeSmiInstr({})", taggedCidReg.Name(), objReg.Name());
 	}
 
-	A64::Register taggedCidReg;
-	A64::Register objReg;
+	CpuRegister taggedCidReg;
+	CpuRegister objReg;
 	std::unique_ptr<LoadValueInstr> il_loadImm;
 	std::unique_ptr<BranchIfSmiInstr> il_branchIfSmi;
 	std::unique_ptr<LoadClassIdInstr> il_loadClassId;
@@ -391,7 +391,7 @@ public:
 
 class BoxInt64Instr : public ILInstr {
 public:
-	BoxInt64Instr(AddrRange addrRange, A64::Register objReg, A64::Register srcReg) : ILInstr(BoxInt64, addrRange), objReg(objReg), srcReg(srcReg) {}
+	BoxInt64Instr(AddrRange addrRange, CpuRegister objReg, CpuRegister srcReg) : ILInstr(BoxInt64, addrRange), objReg(objReg), srcReg(srcReg) {}
 	BoxInt64Instr() = delete;
 	BoxInt64Instr(BoxInt64Instr&&) = delete;
 	BoxInt64Instr& operator=(const BoxInt64Instr&) = delete;
@@ -400,13 +400,13 @@ public:
 		return std::format("{} = BoxInt64Instr({})", objReg.Name(), srcReg.Name());
 	}
 
-	A64::Register objReg;
-	A64::Register srcReg;
+	CpuRegister objReg;
+	CpuRegister srcReg;
 };
 
 class UnboxIntInstr : public ILInstr {
 public:
-	UnboxIntInstr(AddrRange addrRange, A64::Register dstReg, A64::Register srcObjReg, int bits) : ILInstr(UnboxInt, addrRange), dstReg(dstReg), srcObjReg(srcObjReg), bits(bits) {}
+	UnboxIntInstr(AddrRange addrRange, CpuRegister dstReg, CpuRegister srcObjReg, int bits) : ILInstr(UnboxInt, addrRange), dstReg(dstReg), srcObjReg(srcObjReg), bits(bits) {}
 	UnboxIntInstr() = delete;
 	UnboxIntInstr(UnboxIntInstr&&) = delete;
 	UnboxIntInstr& operator=(const UnboxIntInstr&) = delete;
@@ -415,14 +415,14 @@ public:
 		return std::format("{} = UnboxInt{}Instr({})", dstReg.Name(), bits, srcObjReg.Name());
 	}
 
-	A64::Register dstReg;
-	A64::Register srcObjReg;
+	CpuRegister dstReg;
+	CpuRegister srcObjReg;
 	int bits;
 };
 
 class AllocateObjectInstr : public ILInstr {
 public:
-	AllocateObjectInstr(AddrRange addrRange, A64::Register dstReg, DartClass& dartCls)
+	AllocateObjectInstr(AddrRange addrRange, CpuRegister dstReg, DartClass& dartCls)
 		: ILInstr(AllocateObject, addrRange), dstReg(dstReg), dartCls(dartCls){}
 	AllocateObjectInstr() = delete;
 	AllocateObjectInstr(AllocateObjectInstr&&) = delete;
@@ -432,7 +432,7 @@ public:
 		return std::format("{} = inline_Allocate{}()", dstReg.Name(), dartCls.Name());
 	}
 
-	A64::Register dstReg;
+	CpuRegister dstReg;
 	DartClass& dartCls;
 };
 
@@ -474,7 +474,7 @@ struct ArrayOp {
 
 class LoadArrayElementInstr : public ILInstr {
 public:
-	LoadArrayElementInstr(AddrRange addrRange, A64::Register dstReg, A64::Register arrReg, VarStorage idx, ArrayOp arrayOp)
+	LoadArrayElementInstr(AddrRange addrRange, CpuRegister dstReg, CpuRegister arrReg, VarStorage idx, ArrayOp arrayOp)
 		: ILInstr(LoadArrayElement, addrRange), dstReg(dstReg), arrReg(arrReg), idx(idx), arrayOp(arrayOp) {}
 	LoadArrayElementInstr() = delete;
 	LoadArrayElementInstr(LoadArrayElementInstr&&) = delete;
@@ -484,15 +484,15 @@ public:
 		return std::format("ArrayLoad: {} = {}[{}]  ; {}", dstReg.Name(), arrReg.Name(), idx.Name(), arrayOp.ToString());
 	}
 
-	A64::Register dstReg;
-	A64::Register arrReg;
+	CpuRegister dstReg;
+	CpuRegister arrReg;
 	VarStorage idx;
 	ArrayOp arrayOp;
 };
 
 class StoreArrayElementInstr : public ILInstr {
 public:
-	StoreArrayElementInstr(AddrRange addrRange, A64::Register valReg, A64::Register arrReg, VarStorage idx, ArrayOp arrayOp)
+	StoreArrayElementInstr(AddrRange addrRange, CpuRegister valReg, CpuRegister arrReg, VarStorage idx, ArrayOp arrayOp)
 		: ILInstr(StoreArrayElement, addrRange), valReg(valReg), arrReg(arrReg), idx(idx), arrayOp(arrayOp) {}
 	StoreArrayElementInstr() = delete;
 	StoreArrayElementInstr(StoreArrayElementInstr&&) = delete;
@@ -502,15 +502,15 @@ public:
 		return std::format("ArrayStore: {}[{}] = {}  ; {}", arrReg.Name(), idx.Name(), valReg.Name(), arrayOp.ToString());
 	}
 
-	A64::Register valReg;
-	A64::Register arrReg;
+	CpuRegister valReg;
+	CpuRegister arrReg;
 	VarStorage idx;
 	ArrayOp arrayOp;
 };
 
 class LoadFieldInstr : public ILInstr {
 public:
-	LoadFieldInstr(AddrRange addrRange, A64::Register dstReg, A64::Register objReg, uint32_t offset)
+	LoadFieldInstr(AddrRange addrRange, CpuRegister dstReg, CpuRegister objReg, uint32_t offset)
 		: ILInstr(LoadField, addrRange), dstReg(dstReg), objReg(objReg), offset(offset) {}
 	LoadFieldInstr() = delete;
 	LoadFieldInstr(LoadFieldInstr&&) = delete;
@@ -520,16 +520,16 @@ public:
 		return std::format("LoadField: {} = {}->field_{:x}", dstReg.Name(), objReg.Name(), offset);
 	}
 
-	A64::Register dstReg;
-	A64::Register objReg;
+	CpuRegister dstReg;
+	CpuRegister objReg;
 	uint32_t offset;
 };
 
 class StoreFieldInstr : public ILInstr {
 public:
-	StoreFieldInstr(AddrRange addrRange, A64::Register valReg, A64::Register objReg, uint32_t offset)
+	StoreFieldInstr(AddrRange addrRange, CpuRegister valReg, CpuRegister objReg, uint32_t offset)
 		: ILInstr(StoreField, addrRange), valReg(valReg), objReg(objReg), offset(offset) {}
-	StoreFieldInstr(cs_insn* insn, A64::Register valReg, A64::Register objReg, uint32_t offset)
+	StoreFieldInstr(cs_insn* insn, CpuRegister valReg, CpuRegister objReg, uint32_t offset)
 		: ILInstr(StoreField, insn), valReg(valReg), objReg(objReg), offset(offset) {}
 	StoreFieldInstr() = delete;
 	StoreFieldInstr(StoreFieldInstr&&) = delete;
@@ -539,8 +539,8 @@ public:
 		return std::format("StoreField: {}->field_{:x} = {}", objReg.Name(), offset, valReg.Name());
 	}
 
-	A64::Register valReg;
-	A64::Register objReg;
+	CpuRegister valReg;
+	CpuRegister objReg;
 	uint32_t offset;
 };
 
@@ -568,7 +568,7 @@ protected:
 
 class LoadStaticFieldInstr : public ILInstr {
 public:
-	LoadStaticFieldInstr(AddrRange addrRange, A64::Register dstReg, uint32_t fieldOffset)
+	LoadStaticFieldInstr(AddrRange addrRange, CpuRegister dstReg, uint32_t fieldOffset)
 		: ILInstr(LoadStaticField, addrRange), dstReg(dstReg), fieldOffset(fieldOffset) {}
 	LoadStaticFieldInstr() = delete;
 	LoadStaticFieldInstr(LoadStaticFieldInstr&&) = delete;
@@ -579,13 +579,13 @@ public:
 	}
 
 protected:
-	A64::Register dstReg;
+	CpuRegister dstReg;
 	uint32_t fieldOffset;
 };
 
 class StoreStaticFieldInstr : public ILInstr {
 public:
-	StoreStaticFieldInstr(AddrRange addrRange, A64::Register valReg, uint32_t fieldOffset)
+	StoreStaticFieldInstr(AddrRange addrRange, CpuRegister valReg, uint32_t fieldOffset)
 		: ILInstr(LoadStaticField, addrRange), valReg(valReg), fieldOffset(fieldOffset) {}
 	StoreStaticFieldInstr() = delete;
 	StoreStaticFieldInstr(StoreStaticFieldInstr&&) = delete;
@@ -596,13 +596,13 @@ public:
 	}
 
 protected:
-	A64::Register valReg;
+	CpuRegister valReg;
 	uint32_t fieldOffset;
 };
 
 class WriteBarrierInstr : public ILInstr {
 public:
-	WriteBarrierInstr(AddrRange addrRange, A64::Register objReg, A64::Register valReg, bool isArray)
+	WriteBarrierInstr(AddrRange addrRange, CpuRegister objReg, CpuRegister valReg, bool isArray)
 		: ILInstr(WriteBarrier, addrRange), objReg(objReg), valReg(valReg), isArray(isArray) {}
 	WriteBarrierInstr() = delete;
 	WriteBarrierInstr(WriteBarrierInstr&&) = delete;
@@ -612,14 +612,14 @@ public:
 		return std::format("{}WriteBarrierInstr(obj = {}, val = {})", isArray ? "Array" : "", objReg.Name(), valReg.Name());
 	}
 
-	A64::Register objReg;
-	A64::Register valReg;
+	CpuRegister objReg;
+	CpuRegister valReg;
 	bool isArray;
 };
 
 class TestTypeInstr : public ILInstr {
 public:
-	TestTypeInstr(AddrRange addrRange, A64::Register srcReg, std::string typeName)
+	TestTypeInstr(AddrRange addrRange, CpuRegister srcReg, std::string typeName)
 		: ILInstr(TestType, addrRange), srcReg(srcReg), typeName(std::move(typeName)) {}
 	TestTypeInstr() = delete;
 	TestTypeInstr(TestTypeInstr&&) = delete;
@@ -629,6 +629,6 @@ public:
 		return std::format("{} as {}", srcReg.Name(), typeName);
 	}
 
-	A64::Register srcReg;
+	CpuRegister srcReg;
 	std::string typeName;
 };

@@ -15,7 +15,13 @@
 // runtime/bin/macho_loader.cc. Keep this reader independent of SDK headers:
 // older SDKs (including our iOS fixture's 2.19.6) have no Mach-O header.
 namespace {
-constexpr uint32_t kArm64 = 0x0100000c;
+#if defined(TARGET_ARCH_X64)
+constexpr uint32_t kTargetCpu = 0x01000007;
+constexpr uint32_t kTargetSubtype = 3;
+#else
+constexpr uint32_t kTargetCpu = 0x0100000c;
+constexpr uint32_t kTargetSubtype = 0;
+#endif
 constexpr uint32_t kMach64 = 0xfeedfacf;
 constexpr uint32_t kFat = 0xcafebabe;
 constexpr size_t kAlignment = 0x10000;
@@ -47,7 +53,7 @@ struct Reader {
 	uint64_t U64(uint64_t offset) const { return U32(offset) | uint64_t(U32(offset + 4)) << 32; }
 };
 
-Reader SelectArm64(Reader file)
+Reader SelectTarget(Reader file)
 {
 	if (file.BE32(0) != kFat)
 		return file;
@@ -65,12 +71,12 @@ Reader SelectArm64(Reader file)
 		Require(offset >= tableEnd && size != 0, "Invalid universal slice range");
 		Require(alignment < 32 && (uint64_t(offset) % (uint64_t{1} << alignment)) == 0, "Invalid slice alignment");
 		auto slice = file.Range(offset, size);
-		if (cpu == kArm64 && (subtype & 0x00ffffff) == 0) {
-			Require(selected.empty(), "Ambiguous ordinary ARM64 slices");
+		if (cpu == kTargetCpu && (subtype & 0x00ffffff) == kTargetSubtype) {
+			Require(selected.empty(), "Ambiguous target architecture slices");
 			selected = slice;
 		}
 	}
-	Require(!selected.empty(), "No ordinary ARM64 slice (arm64e and x64 are not supported here)");
+	Require(!selected.empty(), "No matching target architecture slice");
 	return {selected};
 }
 
@@ -106,10 +112,10 @@ bool MachOHelper::IsMachO(const char* path)
 LibAppInfo MachOHelper::MapLibApp(const char* path)
 {
 	const auto bytes = ReadFile(path);
-	const auto file = SelectArm64(Reader{bytes});
+	const auto file = SelectTarget(Reader{bytes});
 	Require(file.U32(0) == kMach64, "Expected little-endian Mach-O 64 or FAT32 universal container");
 	file.Range(0, 32);
-	Require(file.U32(4) == kArm64 && (file.U32(8) & 0x00ffffff) == 0, "Expected ordinary ARM64 (arm64e is deferred)");
+	Require(file.U32(4) == kTargetCpu && (file.U32(8) & 0x00ffffff) == kTargetSubtype, "Expected matching ARM64 or x64 target (arm64e is deferred)");
 	Require(file.U32(12) == 6, "Expected a snapshot dynamic library"); // MH_DYLIB
 	const auto count = file.U32(16);
 	const auto commandsSize = file.U32(20);

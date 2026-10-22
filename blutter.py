@@ -54,6 +54,13 @@ def find_lib_files(indir: str):
     android = tuple(os.path.abspath(os.path.join(indir, name)) for name in ('libapp.so', 'libflutter.so'))
     if all(os.path.isfile(path) for path in android):
         return android
+    for app, engine in (('data/app.so', 'flutter_windows.dll'),
+                        ('lib/libapp.so', 'lib/libflutter_linux_gtk.so'),
+                        ('app.so', 'flutter_windows.dll'),
+                        ('libapp.so', 'libflutter_linux_gtk.so')):
+        pair = tuple(os.path.abspath(os.path.join(indir, name)) for name in (app, engine))
+        if all(os.path.isfile(path) for path in pair):
+            return pair
     for prefix in ('', 'Frameworks', 'Contents/Frameworks'):
         def first(candidates):
             return next((os.path.abspath(os.path.join(indir, prefix, path)) for path in candidates
@@ -184,10 +191,10 @@ def cmake_blutter(input: BlutterInput):
     subprocess.run([CMAKE_CMD, '--build', builddir], check=True)
     subprocess.run([CMAKE_CMD, '--install', '.'], cwd=builddir, check=True)
 
-def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
+def get_dart_lib_info(libapp_path: str, libflutter_path: str, target_arch=None) -> DartLibInfo:
     # getting dart version
     from extract_dart_info import extract_dart_info
-    dart_version, snapshot_hash, flags, arch, os_name = extract_dart_info(libapp_path, libflutter_path)
+    dart_version, snapshot_hash, flags, arch, os_name = extract_dart_info(libapp_path, libflutter_path, target_arch)
     print(f'Dart version: {dart_version}, Snapshot: {snapshot_hash}, Target: {os_name} {arch}')
     print('flags: ' + ' '.join(flags))
 
@@ -245,12 +252,12 @@ def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_bl
     input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
     build_and_run(input)
     
-def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
-    dart_info = get_dart_lib_info(libapp_path, libflutter_path)
+def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, target_arch=None):
+    dart_info = get_dart_lib_info(libapp_path, libflutter_path, target_arch)
     input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
     build_and_run(input)
 
-def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, target_arch=None):
     extension = os.path.splitext(indir)[1].lower()
     if os.path.isfile(indir) and extension in ('.apk', '.ipa', '.zip'):
         scratch = os.path.join(SCRIPT_DIR, 'temp')
@@ -258,10 +265,10 @@ def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no
         with tempfile.TemporaryDirectory(prefix='blutter-input-', dir=scratch) as tmp_dir:
             extract = extract_libs_from_apk if extension == '.apk' else extract_libs_from_apple_archive
             libapp_file, libflutter_file = extract(indir, tmp_dir)
-            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, target_arch)
     else:
         libapp_file, libflutter_file = find_lib_files(indir)
-        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, target_arch)
 
 
 if __name__ == "__main__":
@@ -270,6 +277,7 @@ if __name__ == "__main__":
         description='Reversing a flutter application tool')
     parser.add_argument('indir', help='An APK, IPA, macOS app ZIP, app bundle, or directory containing the AOT and engine binaries')
     parser.add_argument('outdir', help='An output directory')
+    parser.add_argument('--arch', choices=('arm64', 'x64'), help='Select architecture in a universal Mach-O (default: arm64)')
     parser.add_argument('--rebuild', action='store_true', default=False, help='Force rebuild the Blutter executable')
     parser.add_argument('--vs-sln', action='store_true', default=False, help='Generate Visual Studio solution at <outdir>')
     parser.add_argument('--no-analysis', action='store_true', default=False, help='Do not build with code analysis')
@@ -278,6 +286,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.dart_version is None:
-        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.arch)
     else:
         main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)

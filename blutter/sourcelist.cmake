@@ -1,7 +1,6 @@
 set(SRCS 
     CodeAnalyzer.cpp
     CodeAnalyzer.h
-    CodeAnalyzer_arm64.cpp
     DartApp.cpp
     DartApp.h
     DartClass.cpp
@@ -25,11 +24,10 @@ set(SRCS
     DartTypes.h
     Disassembler.cpp
     Disassembler.h
-    Disassembler_arm64.cpp
-    Disassembler_arm64.h
     ElfHelper.cpp
     ElfHelper.h
     MachOHelper.cpp
+    ObjectPool.h
     MachOHelper.h
     FridaWriter.cpp
     FridaWriter.h
@@ -45,3 +43,9 @@ set(SRCS
     #pch.cpp
     pch.h
 )
+
+if (DARTLIB MATCHES "_x64($|_)")
+    list(APPEND SRCS CodeAnalyzer_x64.cpp Disassembler_x64.cpp Disassembler_x64.h)
+else()
+    list(APPEND SRCS CodeAnalyzer_arm64.cpp Disassembler_arm64.cpp Disassembler_arm64.h)
+endif()

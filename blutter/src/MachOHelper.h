@@ -1,7 +1,7 @@
 #pragma once
 #include "ElfHelper.h"
 
-// Offline mapping of ordinary ARM64 Dart snapshot dylibs. No dyld calls or
+// Offline mapping of ARM64/x64 Dart snapshot dylibs. No dyld calls or
 // target code execution; the returned owner keeps the writable image alive.
 class MachOHelper final {
 public:

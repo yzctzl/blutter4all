@@ -53,12 +53,12 @@ int main(int argc, char** argv)
 		dumper.DumpCode((outDir / "asm").string().c_str());
 		dumper.Dump4Ida(outDir / "ida_script");
 
-#if defined(DART_COMPRESSED_POINTERS)
+#if defined(DART_COMPRESSED_POINTERS) && defined(TARGET_ARCH_ARM64)
 		std::cout << "Generating Frida script\n";
 		FridaWriter fwriter{ app };
 		fwriter.Create((outDir / "blutter_frida.js").string().c_str());
 #else
-		std::cout << "Skipping Frida script: the current template requires compressed pointers\n";
+		std::cout << "Skipping Frida script: the current template requires ARM64 compressed pointers\n";
 #endif
 
 		app.ExitScope();

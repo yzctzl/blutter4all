@@ -413,6 +413,7 @@ public:
 		return GetCsRegSize(ops[0].reg);
 	}
 
+	unsigned MemoryBase(size_t i) const { return ops[i].type == ARM64_OP_MEM ? ops[i].mem.base : ARM64_REG_INVALID; }
 	cs_insn* ptr() { return insn; }
 	uint64_t address() const { return insn->address; }
 	uint16_t size() const { return insn->size; }
@@ -426,15 +427,6 @@ public:
 	const char* op_str() const { return insn->op_str; }
 };
 
-struct AddrRange {
-	uint64_t start{ 0 };
-	uint64_t end{ 0 };
-
-	AddrRange() = default;
-	AddrRange(uint64_t start, uint64_t end) : start{ start }, end{ end } {}
-
-	bool Has(uint64_t addr) const { return addr >= start && addr < end; }
-};
 
 class AsmIterator {
 	cs_insn* insnStart;

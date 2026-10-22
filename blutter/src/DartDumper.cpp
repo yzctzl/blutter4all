@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "ObjectPool.h"
 #include "DartDumper.h"
 #include <fstream>
 #include <format>
@@ -186,32 +187,35 @@ std::vector<std::pair<intptr_t, std::string>> DartDumper::DumpStructHeaderFile(s
 	intptr_t num = pool.Length();
 
 	auto& obj = dart::Object::Handle();
-	for (intptr_t i = num - 1; i >= 0; i--) {
-		// the Dart Code access ObjectPool with offset that is not subtract by kHeapObjectTag (1)
-		//   so we have to add 1 to make the offset same as offset in the code
-		intptr_t offset = dart::ObjectPool::OffsetFromIndex(i) + 1;
+	for (intptr_t i = 0; i < num; ++i) {
+		// Structure members use untagged object offsets, in ascending order.
+		const auto offset = dart::ObjectPool::element_offset(i);
 		std::string name;
 
 		auto objType = pool.TypeAt(i);
 		if (objType == dart::ObjectPool::EntryType::kTaggedObject) {
 			obj = pool.ObjectAt(i);
 			if (obj.IsUnlinkedCall()) {
-				// since Dart 3.10, target type might be kTaggedObject
-				auto unlinkTargetType = pool.TypeAt(i + 1);
-				if (unlinkTargetType == dart::ObjectPool::EntryType::kImmediate) {
-					const auto imm = pool.RawValueAt(i + 1);
-					auto dartFn = app.GetFunction(imm - app.base());
-					if (dartFn != nullptr) {
-						name = std::format("UnlinkedCall_{:#x}_{:#x}", offset, dartFn->Address(), offset);
+				const auto targetIndex = UnlinkedCallTargetIndex(i);
+				name = std::format("UnlinkedCall_{:#x}_unknown", offset);
+				if (targetIndex >= 0 && targetIndex < num) {
+					// since Dart 3.10, target type might be kTaggedObject
+					auto unlinkTargetType = pool.TypeAt(targetIndex);
+					if (unlinkTargetType == dart::ObjectPool::EntryType::kImmediate) {
+						const auto imm = pool.RawValueAt(targetIndex);
+						auto dartFn = app.GetFunction(imm - app.base());
+						if (dartFn != nullptr) {
+							name = std::format("UnlinkedCall_{:#x}_{:#x}", offset, dartFn->Address(), offset);
+						}
+						else {
+							name = std::format("UnlinkedCall_{:#x}_unknown", offset);
+						}
 					}
 					else {
-						name = std::format("UnlinkedCall_{:#x}_unknown", offset);
+						ASSERT(unlinkTargetType == dart::ObjectPool::EntryType::kTaggedObject);
+						const auto imm = pool.RawValueAt(targetIndex);
+						name = std::format("UnlinkedCall_{:#x}_tagged_{:#x}", offset, imm - app.base());
 					}
-				}
-				else {
-					ASSERT(unlinkTargetType == dart::ObjectPool::EntryType::kTaggedObject);
-					const auto imm = pool.RawValueAt(i + 1);
-					name = std::format("UnlinkedCall_{:#x}_tagged_{:#x}", offset, imm - app.base());
 				}
 			}
 			else {
@@ -265,11 +269,7 @@ void DartDumper::applyStruct4Ida(std::ostream& of)
 					const auto op_count = insn.op_count();
 
 					for (uint8_t j = 0; j < op_count; j++) {
-						auto reg = ARM64_REG_INVALID;
-						if (insn.ops[j].type == ARM64_OP_REG)
-							reg = insn.ops[j].reg;
-						else if (insn.ops[j].type == ARM64_OP_MEM)
-							reg = insn.ops[j].mem.base;
+						const auto reg = insn.MemoryBase(j);
 						if (reg == CSREG_DART_THR) {
 							of << "ida_ua.decode_insn(insn, " << insn.address() << ")\n";
 							of << "idc.op_stroff(insn, " << (int)j << ", thrs, 0)\n";
@@ -278,7 +278,7 @@ void DartDumper::applyStruct4Ida(std::ostream& of)
 						else if (reg == CSREG_DART_PP) {
 							// TODO: if it is not MEM operand, reg cannot be struct offset
 							of << "ida_ua.decode_insn(insn, " << insn.address() << ")\n";
-							of << "idc.op_stroff(insn, " << (int)j << ", pps, 0)\n";
+							of << "idc.op_stroff(insn, " << (int)j << ", pps, " << kPoolPointerTag << ")\n";
 							break;
 						}
 					}
@@ -810,16 +810,21 @@ std::string DartDumper::dumpInstanceFields(dart::Object& obj, DartClass& dartCls
 std::string DartDumper::getPoolObjectDescription(intptr_t offset, bool simpleForm)
 {
 	const auto& pool = app.GetObjectPool();
-	intptr_t idx = dart::ObjectPool::IndexFromOffset(offset);
+	intptr_t idx = PoolIndexFromOffset(offset);
+	offset = PoolInstructionOffset(offset);
 	auto objType = pool.TypeAt(idx);
 	// see how the EntryType is handled from vm/object_service.cc - ObjectPool::PrintJSONImpl()
 	if (objType == dart::ObjectPool::EntryType::kTaggedObject) {
 		auto& obj = dart::Object::Handle(pool.ObjectAt(idx));
 		if (obj.IsUnlinkedCall()) {
-			// since Dart 3.10, target type might be kTaggedObject
-			auto unlinkTargetType = pool.TypeAt(idx + 1);
+			// EmitInstanceCallAOT places the entry before data on x64.
+			const auto targetIndex = UnlinkedCallTargetIndex(idx);
+			if (targetIndex < 0 || targetIndex >= pool.Length())
+				return std::format("[pp+{:#x}] {}", offset, ObjectToString(obj, simpleForm));
+			// Since Dart 3.10, target type might be kTaggedObject.
+			auto unlinkTargetType = pool.TypeAt(targetIndex);
 			if (unlinkTargetType == dart::ObjectPool::EntryType::kImmediate) {
-				const auto imm = pool.RawValueAt(idx + 1);
+				const auto imm = pool.RawValueAt(targetIndex);
 				auto dartFn = app.GetFunction(imm - app.base());
 				if (dartFn != nullptr) {
 					return std::format("[pp+{:#x}] UnlinkedCall: {:#x} - {}", offset, dartFn->Address(), dartFn->FullName().c_str());
@@ -830,7 +835,7 @@ std::string DartDumper::getPoolObjectDescription(intptr_t offset, bool simpleFor
 			}
 			else {
 				ASSERT(unlinkTargetType == dart::ObjectPool::EntryType::kTaggedObject);
-				auto& obj2 = dart::Object::Handle(pool.ObjectAt(idx + 1));
+				auto& obj2 = dart::Object::Handle(pool.ObjectAt(targetIndex));
 				return std::format("[pp+{:#x}] UnlinkedCall: {}", offset, ObjectToString(obj2, simpleForm));
 			}
 		}
@@ -874,13 +879,13 @@ void DartDumper::DumpObjectPool(const char* filename)
 	of << std::format("pool heap offset: {:#x}\n", raw_addr - app.heap_base());
 
 	for (intptr_t i = 0; i < num; i++) {
-		// offset here is from ObjectPool pointer subtracted by kHeapObjectTag
-		// add 1 to make the offset value same as offset in compiled code
-		intptr_t offset = dart::ObjectPool::OffsetFromIndex(i);
-		auto txt = getPoolObjectDescription(offset + 1, false);
+		const auto offset = dart::ObjectPool::element_offset(i);
+		auto txt = getPoolObjectDescription(offset, false);
 		of << txt << "\n";
+#if defined(TARGET_ARCH_ARM64)
 		if (txt.compare(txt.find(']'), 15, "] UnlinkedCall:") == 0)
-			i++;
+			i++; // ARM64 prints its following entry together with call data.
+#endif
 	}
 }
 

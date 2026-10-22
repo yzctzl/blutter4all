@@ -96,3 +96,34 @@ python blutter.py path\to\lib\arm64-v8a build\vs --vs-sln
 - Obfuscated app (still missing many functions)
 - Reading iOS binary
 - Input as apk or ipa
+
+### Desktop x64 snapshots
+
+The x64 backend accepts Windows/Linux ELF AOT snapshots and macOS x64
+Mach-O snapshot dylibs. Loading is offline and does not run target code.
+PE AOT snapshots and arm64e remain deferred.
+
+Pass an unpacked Windows application directory (`data/app.so` and
+`flutter_windows.dll`), a Linux application directory (`lib/libapp.so` and
+`lib/libflutter_linux_gtk.so`), or a macOS app bundle. For a universal macOS
+binary, select x64 explicitly:
+
+```sh
+python blutter.py path/to/windows-or-linux-app output
+python blutter.py path/to/Example.app output --arch x64
+```
+
+With only the AOT binary available, specify the matching SDK and target:
+
+```sh
+python blutter.py path/to/app.so output --dart-version 3.11.5_windows_x64
+```
+
+The shared snapshot pipeline exports libraries, classes, fields, objects and
+methods. The x64 analyzer recognizes frames, stack checks, pool/thread loads,
+calls, static fields, class IDs, integer unboxing, and object/array accesses
+where the base type is known. Other instructions retain their original assembly;
+ARM64 pattern coverage is broader. The Frida template currently requires ARM64
+with compressed pointers. Real Windows/Linux ELF and macOS universal Mach-O
+samples have been exercised on a Linux x64 host; native Windows/macOS host
+builds have not been validated for this change.

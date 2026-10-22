@@ -40,6 +40,7 @@ public:
 		LoadStaticField,
 		StoreStaticField,
 		WriteBarrier,
+		StoreObjectPool,
 		TestType,
 	};
 
@@ -185,7 +186,7 @@ public:
 
 class StoreObjectPoolInstr : public ILInstr {
 public:
-	StoreObjectPoolInstr(AddrRange addrRange, CpuRegister srcReg, int64_t offset) : ILInstr(LoadValue, addrRange), srcReg(srcReg), offset(offset) {}
+	StoreObjectPoolInstr(AddrRange addrRange, CpuRegister srcReg, int64_t offset) : ILInstr(StoreObjectPool, addrRange), srcReg(srcReg), offset(offset) {}
 	StoreObjectPoolInstr() = delete;
 	StoreObjectPoolInstr(StoreObjectPoolInstr&&) = delete;
 	StoreObjectPoolInstr& operator=(const StoreObjectPoolInstr&) = delete;
@@ -281,6 +282,8 @@ public:
 		return "InitAsync() -> " + retType->ToString();
 	}
 
+	DartType* ReturnType() const { return retType; }
+
 protected:
 	DartType* retType;
 };
@@ -293,7 +296,13 @@ public:
 	GdtCallInstr& operator=(const GdtCallInstr&) = delete;
 
 	virtual std::string ToString() {
+#if defined(TARGET_ARCH_X64)
+		return std::format("{} = GDT[cid_{} + {:#x}]()",
+			CpuRegister{dart::CallingConventions::kReturnReg}.Name(),
+			CpuRegister{dart::DispatchTableNullErrorABI::kClassIdReg}.Name(), offset);
+#else
 		return std::format("r0 = GDT[cid_x0 + {:#x}]()", offset);
+#endif
 	}
 
 protected:
@@ -355,17 +364,20 @@ public:
 
 class LoadClassIdInstr : public ILInstr {
 public:
-	LoadClassIdInstr(AddrRange addrRange, CpuRegister objReg, CpuRegister cidReg) : ILInstr(LoadClassId, addrRange), objReg(objReg), cidReg(cidReg) {}
+	LoadClassIdInstr(AddrRange addrRange, CpuRegister objReg, CpuRegister cidReg, bool mayBeSmi = false)
+		: ILInstr(LoadClassId, addrRange), objReg(objReg), cidReg(cidReg), mayBeSmi(mayBeSmi) {}
 	LoadClassIdInstr() = delete;
 	LoadClassIdInstr(LoadClassIdInstr&&) = delete;
 	LoadClassIdInstr& operator=(const LoadClassIdInstr&) = delete;
 
 	virtual std::string ToString() {
-		return std::format("{} = LoadClassIdInstr({})", cidReg.Name(), objReg.Name());
+		return std::format("{} = {}({})", cidReg.Name(),
+			mayBeSmi ? "LoadClassIdMayBeSmiInstr" : "LoadClassIdInstr", objReg.Name());
 	}
 
 	CpuRegister objReg;
 	CpuRegister cidReg;
+	bool mayBeSmi;
 };
 
 class LoadTaggedClassIdMayBeSmiInstr : public ILInstr {
@@ -586,7 +598,7 @@ protected:
 class StoreStaticFieldInstr : public ILInstr {
 public:
 	StoreStaticFieldInstr(AddrRange addrRange, CpuRegister valReg, uint32_t fieldOffset)
-		: ILInstr(LoadStaticField, addrRange), valReg(valReg), fieldOffset(fieldOffset) {}
+		: ILInstr(StoreStaticField, addrRange), valReg(valReg), fieldOffset(fieldOffset) {}
 	StoreStaticFieldInstr() = delete;
 	StoreStaticFieldInstr(StoreStaticFieldInstr&&) = delete;
 	StoreStaticFieldInstr& operator=(const StoreStaticFieldInstr&) = delete;

@@ -23,8 +23,22 @@ public:
 	uintptr_t heap_base() const { return heap_base_; }
 
 	DartClass* GetClass(intptr_t cid);
+	DartClass* FindClass(intptr_t cid) const {
+		return cid >= 0 && static_cast<size_t>(cid) < classes.size() ? classes[cid] : nullptr;
+	}
 	DartFnBase* GetFunction(uint64_t addr);
+	DartFnBase* FindFunctionExact(uint64_t addr) const {
+		if (auto found = functions.find(addr); found != functions.end())
+			return found->second;
+		if (auto found = stubs.find(addr); found != stubs.end())
+			return found->second;
+		return nullptr;
+	}
 	DartField* GetStaticField(intptr_t offset) { return staticFields.at(offset); }
+	DartField* FindStaticField(intptr_t offset) const {
+		auto found = staticFields.find(offset);
+		return found != staticFields.end() ? found->second : nullptr;
+	}
 
 	dart::ObjectPool& GetObjectPool() { return *ppool; }
 	DartTypeDb* TypeDb() { return typeDb.get(); }

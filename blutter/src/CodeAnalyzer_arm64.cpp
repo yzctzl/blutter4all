@@ -2673,7 +2673,13 @@ std::unique_ptr<TestTypeInstr> FunctionAnalyzer::processInstanceofNoTypeArgument
 
 std::unique_ptr<BranchIfSmiInstr> FunctionAnalyzer::processBranchIfSmiInstr(AsmIterator& insn)
 {
-	if (insn.id() == ARM64_INS_TBZ && insn.ops(1).imm == dart::kSmiTag && dart::kCompressedWordSize == GetCsRegSize(insn.ops(0).reg)) {
+	// SDK BranchIfSmi tests only the tag bit. TBZ bit zero is encoded and
+	// decoded with a W register, including for an uncompressed 64-bit object.
+	if (insn.id() == ARM64_INS_TBZ && insn.op_count() == 3) {
+		if (insn.ops(0).type != ARM64_OP_REG || insn.ops(1).type != ARM64_OP_IMM)
+			return nullptr;
+		if (insn.ops(1).imm != dart::kSmiTag || insn.ops(2).type != ARM64_OP_IMM)
+			return nullptr;
 		const auto objReg = A64::Register{ insn.ops(0).reg };
 		const auto branchAddr = insn.ops(2).imm;
 		const auto ins0_addr = insn.address();
@@ -3460,7 +3466,12 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 
 	if (insn.ops(1).mem.base != CSREG_DART_FP && insn.ops(1).mem.disp != 0) {
 		// load/store with fixed offset
-		const auto arrayOp = getArrayOp(insn, insn.ops(1).mem.disp);
+		auto arrayOp = getArrayOp(insn, insn.ops(1).mem.disp);
+		// SDK FieldAddress and ElementAddressForIntIndex can produce the same
+		// displacement. A payload-looking offset alone does not prove a List:
+		// user classes can have an unboxed field at that exact offset too.
+		if (arrayOp.arrType == ArrayOp::List)
+			arrayOp.arrType = ArrayOp::Unknown;
 		if (arrayOp.IsArrayOp()) {
 			const auto valReg = A64::Register{ insn.ops(0).reg };
 			const auto objReg = A64::Register{ insn.ops(1).mem.base };
@@ -3468,9 +3479,15 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 			++insn;
 
 			if (arrayOp.arrType == ArrayOp::Unknown) {
-				// might be array or object. set it as object first.
+				// Keep ambiguous word accesses as generic fields. A header, a
+				// misaligned address or a byte load does not establish a Dart slot.
+				const auto fieldOffset = offset + dart::kHeapObjectTag;
+				if (fieldOffset < dart::kWordSize || fieldOffset % dart::kCompressedWordSize != 0)
+					return nullptr;
+				if (arrayOp.size != dart::kCompressedWordSize && arrayOp.size != 8)
+					return nullptr;
 				if (arrayOp.isLoad) {
-					return std::make_unique<LoadFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+					return std::make_unique<LoadFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, fieldOffset);
 				}
 				else {
 					const auto il_wb = processWriteBarrierInstr(insn);
@@ -3478,13 +3495,20 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 						// with WriteBearrier, we can determine if the object is array or not
 						// but it is still difficult if it is list or typed data
 						INSN_ASSERT(il_wb->objReg == objReg && il_wb->valReg == valReg);
-						if (il_wb->isArray)
-							return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, VarStorage::NewSmallImm(offset), arrayOp);
-						else
-							return std::make_unique<StoreFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+						if (il_wb->isArray) {
+							const auto bytes = offset + dart::kHeapObjectTag - dart::Array::data_offset();
+							if (bytes < 0 || bytes % dart::kCompressedWordSize != 0)
+								return nullptr;
+							if (arrayOp.size != dart::kCompressedWordSize)
+								return nullptr;
+							arrayOp.arrType = ArrayOp::List;
+							const auto idx = VarStorage::NewSmallImm(bytes / dart::kCompressedWordSize);
+							return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, arrayOp);
+						}
+						return std::make_unique<StoreFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, fieldOffset);
 					}
 					else {
-						return std::make_unique<StoreFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+						return std::make_unique<StoreFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, fieldOffset);
 					}
 				}
 			}

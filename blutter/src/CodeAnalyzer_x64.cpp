@@ -16,6 +16,7 @@
 // Unrecognized instructions remain in the assembly output.
 namespace {
 using Reg = X64::Register;
+enum class BarrierKind { Object, Array };
 
 bool isRegisterOperand(const cs_x86_op& op, x86_reg value)
 {
@@ -144,6 +145,23 @@ private:
 	std::map<uint64_t, std::vector<size_t>> incoming;
 };
 
+// Explicit and implicit writes use the same physical-register identity. A
+// partial write kills provenance just as a full-width write does.
+template <typename Visitor>
+void visitWrittenRegisters(const cs_insn& insn, Visitor visit)
+{
+	const auto& detail = *insn.detail;
+	for (unsigned i = 0; i < detail.x86.op_count; ++i) {
+		const auto& op = detail.x86.operands[i];
+		if (op.type == X86_OP_REG && (op.access & CS_AC_WRITE) && Reg{op.reg}.IsSet())
+			visit(Reg{op.reg});
+	}
+	for (unsigned i = 0; i < detail.regs_write_count; ++i) {
+		const Reg reg{static_cast<x86_reg>(detail.regs_write[i])};
+		if (reg.IsSet())
+			visit(reg);
+	}
+}
 
 // These predicates describe entry-block boundaries, not parameter patterns.
 // Frame aliases stop provenance because later indirect writes may reuse a slot.
@@ -224,6 +242,64 @@ std::optional<MemoryAccess> getMemoryAccess(const cs_insn& insn)
 // il_x64.cc, LoadIndexedInstr / StoreIndexedInstr. Decode an index only
 // after the caller proves the payload layout. Register scales distinguish
 // native indices from tagged Smis; constant offsets must align to the element.
+std::optional<VarStorage> getElementIndex(const cs_x86_op& memory, intptr_t payload,
+	ArrayOp& operation)
+{
+	const auto& address = memory.mem;
+	if (address.index == X86_REG_INVALID) {
+		const auto bytes = address.disp + dart::kHeapObjectTag - payload;
+		if (bytes < 0 || bytes % operation.size || bytes / operation.size > INT32_MAX)
+			return std::nullopt;
+		return VarStorage::NewSmallImm(bytes / operation.size);
+	}
+	if (address.disp + dart::kHeapObjectTag != payload || !Reg{address.index}.IsSet())
+		return std::nullopt;
+	if (address.scale == operation.size)
+		operation.indexUnboxed = true;
+	else if (operation.size == 1 || address.scale != operation.size / 2)
+		return std::nullopt;
+	return VarStorage{Reg{address.index}};
+}
+
+// SDK LoadIndexedInstr (ARM64 and x64) chooses the access from the element
+// representation. Keep integer extension separate from ordinary MOV fields;
+// a signed table entry, for example, is not a compressed object reference.
+std::optional<ArrayOp> getTypedIntegerLoad(int cid)
+{
+	switch (cid) {
+	case dart::kTypedDataInt8ArrayCid: return ArrayOp{1, true, ArrayOp::TypedSigned};
+	case dart::kTypedDataUint8ArrayCid:
+	case dart::kTypedDataUint8ClampedArrayCid: return ArrayOp{1, true, ArrayOp::TypedUnsigned};
+	case dart::kTypedDataInt16ArrayCid: return ArrayOp{2, true, ArrayOp::TypedSigned};
+	case dart::kTypedDataUint16ArrayCid: return ArrayOp{2, true, ArrayOp::TypedUnsigned};
+	case dart::kTypedDataInt32ArrayCid: return ArrayOp{4, true, ArrayOp::TypedSigned};
+	case dart::kTypedDataUint32ArrayCid: return ArrayOp{4, true, ArrayOp::TypedUnsigned};
+	case dart::kTypedDataInt64ArrayCid: return ArrayOp{8, true, ArrayOp::TypedSigned};
+	case dart::kTypedDataUint64ArrayCid: return ArrayOp{8, true, ArrayOp::TypedUnsigned};
+	default: return std::nullopt; // External data, views and FP need other paths.
+	}
+}
+
+bool isTypedIntegerLoad(const cs_insn& insn, const ArrayOp& operation)
+{
+	const auto& x = insn.detail->x86;
+	const auto& value = x.operands[0];
+	if (x.operands[1].size != operation.size)
+		return false;
+	if (operation.size == 8)
+		return insn.id == X86_INS_MOV && value.size == 8;
+	if (operation.arrType == ArrayOp::TypedSigned) {
+		if (value.size != 8)
+			return false;
+		return insn.id == (operation.size == 4 ? X86_INS_MOVSXD : X86_INS_MOVSX);
+	}
+	if (operation.size == 4)
+		return insn.id == X86_INS_MOV && value.size == 4; // Zero-extends to 64 bits.
+	if (value.size != 4 && value.size != 8)
+		return false;
+	return insn.id == X86_INS_MOVZX;
+}
+
 bool poolOffset(DartApp& app, const cs_x86_op& op, intptr_t& offset)
 {
 	// SDK: vm/compiler/assembler/assembler_x64.cc,
@@ -353,6 +429,27 @@ private:
 };
 
 
+// SDK CallCFunction reserves target-ABI shadow space. Its optional immediate
+// restoration uses the same size; by default the surrounding scope restores
+// RSP instead. SysV reserves no shadow space.
+bool consumeNativeShadowSpace(InsnCursor& insn, unsigned operation)
+{
+	constexpr auto size = dart::CallingConventions::kShadowSpaceBytes;
+	if constexpr (size == 0)
+		return true;
+	if (!insn.Is(operation, 2) || !isRegisterOperand(insn.Op(0), X86_REG_RSP))
+		return false;
+	if (!isImmediateOperand(insn.Op(1), size))
+		return false;
+	insn.Next();
+	return true;
+}
+
+struct RegisterSaveScope {
+	size_t allocation, release;
+	std::vector<std::pair<size_t, Reg>> saves, restores;
+};
+
 struct TaggedPoolLoad { intptr_t offset; dart::ObjectPtr object; };
 std::optional<TaggedPoolLoad> readTaggedPoolLoad(DartApp& app, const InsnCursor& insn)
 {
@@ -393,12 +490,26 @@ private:
 	std::unique_ptr<ILInstr> processInitLateStaticFieldInstr(InsnCursor& insn);
 #endif
 	std::unique_ptr<ILInstr> processCallInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processLeafRuntimeCallInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processRegisterCallInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processBranchIfSmiInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processLoadFieldTableInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processLoadStore(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processClassIdMayBeSmiInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processTailCallInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processTypeTestInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processRegisterSaveInstr(InsnCursor& insn);
+	std::optional<RegisterSaveScope> readRegisterSaveScope(size_t start);
+	bool readRegisterSaveCall(InsnCursor& cursor, const RegisterSaveScope& scope);
+	std::optional<ArrayOp> elementOperation(const MemoryAccess& access, const cs_insn& insn);
+	std::unique_ptr<ILInstr> fieldAccess(InsnCursor& insn, const MemoryAccess& access,
+		uint32_t offset, FieldAccessEvidence evidence);
+	bool isObjectBase(x86_reg base) const;
+	void updatePointerExclusions(const cs_insn& insn);
+	std::pair<Reg, Reg> readBarrierHeaderTests(InsnCursor& insn);
+	std::optional<BarrierKind> writeBarrierCallKind(const cs_x86_op& target, Reg object);
+	std::unique_ptr<ILInstr> processWriteBarrierInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processBarrierStore(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processLoadDoubleInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processLoadValueInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processStorePoolInstr(InsnCursor& insn);
@@ -413,6 +524,8 @@ private:
 
 	void prepareInstructions();
 	void emit(std::unique_ptr<ILInstr> il, size_t begin, size_t end);
+	std::pair<Reg, DartClass*> objectResult(ILInstr& il);
+	std::pair<Reg, DartClass*> classOnFallthrough(size_t branchIndex);
 	LoadValueInstr* previousLoad(uint64_t address);
 	DartFnBase* resolveCallTarget(const cs_x86_op& target);
 
@@ -421,6 +534,11 @@ private:
 	AnalyzedFnData& data;
 	AsmInstructions& instructions;
 	BranchTargets targets;
+	std::optional<RegisterSaveScope> registerSave;
+	// Only concrete pool objects and allocation/call results justify classes.
+	// Facts stop at branch targets, control transfers and register writes.
+	std::array<DartClass*, Reg::kNumberOfRegisters> objects{};
+	std::array<bool, Reg::kNumberOfRegisters> nonObjects{};
 };
 
 // SDK: vm/compiler/assembler/assembler_x64.cc, EnterFrame / LeaveFrame.
@@ -830,11 +948,84 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processCallInstr(InsnCursor& insn)
 	return nullptr;
 }
 
+// SDK: assembler_x64.cc, LeafRuntimeScope::Call / CallCFunction. The known
+// Thread entry and matching VMTag bracket prove this native leaf invocation.
+// Surrounding frames, alignment and register saves remain separate operations.
+std::unique_ptr<ILInstr> FunctionAnalyzer::processLeafRuntimeCallInstr(InsnCursor& insn)
+{
+	// LeafRuntimeCallInstr can load the entry through a Thread temporary,
+	// then save FP and EnterCFrame before the same VMTag-bracketed call used
+	// by LeafRuntimeScope. Follow only these transfers, never skip a body.
+	auto thread = CSREG_DART_THR;
+	if (insn.Move(X86_REG_RAX, CSREG_DART_THR)) {
+		thread = X86_REG_RAX;
+		insn.Next();
+	}
+	if (!insn.Load(thread))
+		return nullptr;
+	const auto entry = insn.Op(1).mem.disp;
+	if (!GetThreadLeafFunction(entry))
+		return nullptr;
+	const auto target = insn.Op(0).reg;
+	if (isVmStateRegister(Reg{target}))
+		return nullptr;
+	insn.Next();
+	if (target != X86_REG_RAX) {
+		if (!insn.Move(X86_REG_RAX, target))
+			return nullptr;
+		insn.Next();
+	}
+	bool nativeFrame = false;
+	if (insn.Is(X86_INS_MOV, 2) && isRegisterOperand(insn.Op(1), X86_REG_RBP)) {
+		const auto saved = Reg{dart::CallingConventions::kSecondNonArgumentRegister};
+		if (!isRegisterOfSize(insn.Op(0), 8) || Reg{insn.Op(0).reg} != saved)
+			return nullptr;
+		insn.Next();
+		if (!processEnterFrameInstr(insn))
+			return nullptr;
+		insn.Next();
+		// EnterCFrame(0): all supported x64 target ABIs align to 16 bytes.
+		if (!insn.Immediate(X86_INS_AND, X86_REG_RSP, -16))
+			return nullptr;
+		insn.Next();
+		nativeFrame = true;
+	}
+	if (!insn.Is(X86_INS_MOV, 2))
+		return nullptr;
+	const auto tag = dart::Thread::vm_tag_offset();
+	if (!isMemoryOperand(insn.Op(0), CSREG_DART_THR, tag) || insn.Op(0).size != 8)
+		return nullptr;
+	if (!isRegisterOperand(insn.Op(1), X86_REG_RAX))
+		return nullptr;
+	insn.Next();
+	if (!consumeNativeShadowSpace(insn, X86_INS_SUB))
+		return nullptr;
+	if (!insn.Is(X86_INS_CALL, 1) || !isRegisterOperand(insn.Op(0), X86_REG_RAX))
+		return nullptr;
+	insn.Next();
+	if (insn.Is(X86_INS_ADD, 2)) {
+		if (!consumeNativeShadowSpace(insn, X86_INS_ADD))
+			return nullptr;
+	}
+	if (!insn.Is(X86_INS_MOV, 2))
+		return nullptr;
+	if (!isMemoryOperand(insn.Op(0), CSREG_DART_THR, tag) || insn.Op(0).size != 8)
+		return nullptr;
+	if (!isImmediateOperand(insn.Op(1), dart::VMTag::kDartTagId))
+		return nullptr;
+	if (nativeFrame) {
+		insn.Next();
+		if (!processLeaveFrameInstr(insn))
+			return nullptr;
+	}
+	return std::make_unique<CallLeafRuntimeInstr>(insn.Range(), entry);
+}
 
 // SDK: vm/compiler/backend/flow_graph_compiler_x64.cc, EmitInstanceCallAOT;
 // assembler_x64.cc, LeafRuntimeScope::Call / Assembler::CallCFunction.
-// Resolve only adjacent, complete entry-load/call sequences, never arbitrary
-// register calls.
+// VMTag-bracketed leaf calls have their own matcher above. Here only adjacent,
+// complete
+// entry-load/call sequences are resolved, never arbitrary register calls.
 std::unique_ptr<ILInstr> FunctionAnalyzer::processRegisterCallInstr(InsnCursor& insn)
 {
 	auto code = insn;
@@ -910,6 +1101,305 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadFieldTableInstr(InsnCursor
 // SDK StoreBarrier / ArrayStoreBarrier share these header tests. Read the low
 // byte, shift the same 32-bit register, apply Thread's barrier mask, then test
 // the value header. The intrinsic register-shuffle path is deliberately separate.
+std::pair<Reg, Reg> FunctionAnalyzer::readBarrierHeaderTests(InsnCursor& insn)
+{
+	static_assert(dart::kWriteBarrierValueReg == dart::RAX);
+	if (!insn.Is(X86_INS_MOV, 2) || !isLowByteRegister(insn.Op(0)))
+		return {};
+	if (insn.Current()->detail->x86.addr_size != dart::kWordSize)
+		return {};
+	const Reg scratch{insn.Op(0).reg};
+	const auto& header = insn.Op(1);
+	if (header.type != X86_OP_MEM || header.size != 1)
+		return {};
+	if (!isMemoryOperand(header, header.mem.base, -dart::kHeapObjectTag))
+		return {};
+	const Reg object{header.mem.base};
+	if (!object.IsSet() || int(object) >= dart::kNumberOfCpuRegisters)
+		return {};
+	if ((dart::kDartAvailableCpuRegs & (1 << int(object))) == 0)
+		return {};
+	if (object == Reg{dart::kWriteBarrierValueReg} || object == scratch || isVmStateRegister(scratch))
+		return {};
+	if (scratch == Reg{dart::kWriteBarrierValueReg})
+		return {};
+	insn.Next();
+	if (!insn.RegOp(X86_INS_SHR, 4))
+		return {};
+	if (Reg{insn.Op(0).reg} != scratch || !isImmediateOperand(insn.Op(1), dart::UntaggedObject::kBarrierOverlapShift))
+		return {};
+	insn.Next();
+	if (!insn.RegOp(X86_INS_AND, 4))
+		return {};
+	if (Reg{insn.Op(0).reg} != scratch || insn.Op(1).size != 4)
+		return {};
+	if (!isMemoryOperand(insn.Op(1), CSREG_DART_THR, dart::Thread::write_barrier_mask_offset()))
+		return {};
+	insn.Next();
+	if (!insn.Is(X86_INS_TEST, 2) || !isLowByteRegister(insn.Op(1)))
+		return {};
+	if (Reg{insn.Op(1).reg} != scratch || insn.Op(0).size != 1)
+		return {};
+	if (!isMemoryOperand(insn.Op(0), X86_REG_RAX, -dart::kHeapObjectTag))
+		return {};
+	return {object, scratch};
+}
+
+// Direct wrapper calls must identify the *object register's* entry, not merely
+// any address within WriteBarrierWrappers. Use immutable VM code metadata;
+// GetFunction can split that aggregate stub while resolving interior entries.
+std::optional<BarrierKind> FunctionAnalyzer::writeBarrierCallKind(const cs_x86_op& target, Reg object)
+{
+	const auto reg = static_cast<dart::Register>(int(object));
+	if (target.type == X86_OP_MEM && target.size == dart::kWordSize) {
+		if (isMemoryOperand(target, CSREG_DART_THR, dart::Thread::write_barrier_wrappers_thread_offset(reg)))
+			return BarrierKind::Object;
+		if (object == Reg{dart::kWriteBarrierObjectReg} &&
+			isMemoryOperand(target, CSREG_DART_THR, dart::Thread::array_write_barrier_entry_point_offset()))
+			return BarrierKind::Array;
+	}
+	if (target.type != X86_OP_IMM)
+		return std::nullopt;
+	auto* store = dart::IsolateGroup::Current()->object_store();
+	const auto& wrappers = dart::Code::Handle(store->write_barrier_wrappers_stub());
+	const auto wrapper = wrappers.EntryPoint() - app.base() + dart::Thread::WriteBarrierWrappersOffsetForRegister(reg);
+	if (target.imm == wrapper)
+		return BarrierKind::Object;
+	const auto& array = dart::Code::Handle(store->array_write_barrier_stub());
+	if (object == Reg{dart::kWriteBarrierObjectReg} && target.imm == array.EntryPoint() - app.base())
+		return BarrierKind::Array;
+	return std::nullopt;
+}
+
+// SDK StoreBarrier: optional BranchIfSmi and header-mask branch converge
+// immediately after the exact barrier call. No control-flow interior is hidden.
+std::unique_ptr<ILInstr> FunctionAnalyzer::processWriteBarrierInstr(InsnCursor& insn)
+{
+	auto smiCursor = insn;
+	auto smi = processBranchIfSmiInstr(smiCursor);
+	if (smi) {
+		if (static_cast<BranchIfSmiInstr*>(smi.get())->objReg != Reg{dart::kWriteBarrierValueReg})
+			return nullptr;
+		insn.SetPosition(smiCursor.Position());
+		insn.Next();
+	}
+	const auto [object, scratch] = readBarrierHeaderTests(insn);
+	if (!object.IsSet())
+		return nullptr;
+	insn.Next();
+	if (!insn.Branch(X86_INS_JE))
+		return nullptr;
+	const auto join = static_cast<uint64_t>(insn.Op(0).imm);
+	insn.Next();
+	if (!insn.Is(X86_INS_CALL, 1))
+		return nullptr;
+	const auto kind = writeBarrierCallKind(insn.Op(0), object);
+	if (!kind || join != insn.Current()->address + insn.Current()->size)
+		return nullptr;
+	if (*kind == BarrierKind::Array && scratch == Reg{dart::kWriteBarrierSlotReg})
+		return nullptr; // Array barrier must preserve the proven slot address.
+	if (!targets.Index(join).has_value())
+		return nullptr;
+	if (smi && static_cast<BranchIfSmiInstr*>(smi.get())->branchAddr != join)
+		return nullptr;
+	return std::make_unique<WriteBarrierInstr>(insn.Range(), object, Reg{dart::kWriteBarrierValueReg}, *kind == BarrierKind::Array);
+}
+
+// Both stores use the same complete StoreBarrier proof. An Array store first
+// proves its slot with LEA; an ordinary store retains a generic field offset.
+// Neither displacement alone nor the barrier's name establishes an element.
+std::unique_ptr<ILInstr> FunctionAnalyzer::processBarrierStore(InsnCursor& insn)
+{
+	const bool array = insn.Is(X86_INS_LEA, 2);
+	cs_x86_op address{};
+	if (array) {
+		if (!insn.RegOp(X86_INS_LEA) || insn.Current()->detail->x86.addr_size != dart::kWordSize ||
+			Reg{insn.Op(0).reg} != Reg{dart::kWriteBarrierSlotReg}) return nullptr;
+		address = insn.Op(1);
+		if (address.type != X86_OP_MEM || address.mem.segment != X86_REG_INVALID ||
+			Reg{address.mem.base} != Reg{dart::kWriteBarrierObjectReg}) return nullptr;
+		insn.Next();
+	}
+	if (!insn.IsAvailable()) return nullptr;
+	const auto access = getMemoryAccess(*insn.Current());
+	if (!access || access->isLoad || access->value.type != X86_OP_REG ||
+		access->memory.size != dart::kCompressedWordSize) return nullptr;
+	const auto base = array ? address.mem.base : access->memory.mem.base;
+	const auto offset = access->memory.mem.disp + dart::kHeapObjectTag;
+	ArrayOp operation{access->memory.size, false, ArrayOp::List};
+	std::optional<VarStorage> index;
+	if (array) {
+		if (Reg{access->memory.mem.base} != Reg{dart::kWriteBarrierSlotReg} ||
+			!isMemoryOperand(access->memory, access->memory.mem.base, 0) || !app.FindClass(dart::kArrayCid))
+			return nullptr;
+		address.size = access->memory.size; // LEA itself is always native-width.
+		index = getElementIndex(address, dart::Array::data_offset(), operation);
+		if (!index) return nullptr;
+	} else if (!isMemoryOperand(access->memory, base) || offset < dart::kWordSize ||
+		offset > UINT32_MAX || offset % dart::kCompressedWordSize) return nullptr;
+	insn.Next();
+	auto barrierIL = processWriteBarrierInstr(insn);
+	if (!barrierIL) return nullptr;
+	const auto& barrier = static_cast<const WriteBarrierInstr&>(*barrierIL);
+	if (barrier.isArray != array || barrier.objReg != Reg{base} || barrier.valReg != Reg{access->value.reg})
+		return nullptr;
+	if (array)
+		return std::make_unique<StoreArrayElementInstr>(insn.Range(), barrier.valReg, barrier.objReg, *index, operation);
+	return std::make_unique<StoreFieldInstr>(insn.Range(), barrier.valReg, barrier.objReg, offset,
+		FieldAccessEvidence::WriteBarrier);
+}
+
+// SDK LoadIndexed/StoreIndexed: decode the layout and index once for both
+// directions. Known layouts retain their type; shape-only evidence stays inferred.
+std::optional<ArrayOp> FunctionAnalyzer::elementOperation(const MemoryAccess& access, const cs_insn& insn)
+{
+	const auto id = insn.id;
+	const auto& memory = access.memory;
+	const auto payload = memory.mem.disp + dart::kHeapObjectTag;
+	auto* cls = objects[Reg{memory.mem.base}];
+	const int cid = cls ? cls->Id() : dart::kIllegalCid;
+	if (cid == dart::kArrayCid || cid == dart::kImmutableArrayCid) {
+		if (id != X86_INS_MOV || memory.size != dart::kCompressedWordSize)
+			return std::nullopt;
+		return ArrayOp{memory.size, access.isLoad, ArrayOp::List};
+	}
+	// StoreIndexed/LoadIndexed use scalar FP moves for internal float arrays.
+	// The receiver layout, not a payload-looking displacement, proves this;
+	// external data, views and SIMD layouts need different address contracts.
+	if (cid == dart::kTypedDataFloat32ArrayCid || cid == dart::kTypedDataFloat64ArrayCid) {
+		const auto size = cid == dart::kTypedDataFloat32ArrayCid ? 4 : 8;
+		if (id != (size == 4 ? X86_INS_MOVSS : X86_INS_MOVSD) || memory.size != size ||
+			access.value.type != X86_OP_REG || !Reg{access.value.reg}.IsDecimal())
+			return std::nullopt;
+		return ArrayOp{memory.size, access.isLoad, ArrayOp::TypedUnknown};
+	}
+	if (cls && access.isLoad) {
+		if (auto typed = getTypedIntegerLoad(cid)) {
+			if (isTypedIntegerLoad(insn, *typed))
+				return typed;
+			return std::nullopt;
+		}
+	}
+	// Without a proven layout, only register-indexed payloads have enough
+	// evidence. Constant offsets remain fields rather than invented elements.
+	const Reg index{memory.mem.index};
+	if (!isObjectBase(memory.mem.base) || !index.IsSet() || isVmStateRegister(index) ||
+		int(index) >= dart::kNumberOfCpuRegisters)
+		return std::nullopt;
+	const bool string = payload == dart::OneByteString::data_offset() &&
+		id == X86_INS_MOVZX && (memory.size == 1 || memory.size == 2);
+	if (!string && payload != dart::Array::data_offset() && payload != dart::UntaggedTypedData::payload_offset())
+		return std::nullopt;
+	if (cls) {
+		if (cid == dart::kOneByteStringCid || cid == dart::kTwoByteStringCid) {
+			if (!string || memory.size != (cid == dart::kOneByteStringCid ? 1 : 2))
+				return std::nullopt;
+		}
+		else if (string || !dart::IsTypedDataClassId(cid))
+			return std::nullopt;
+		else {
+			const auto typed = getTypedIntegerLoad(cid);
+			if (!typed || typed->size != memory.size)
+				return std::nullopt;
+		}
+	}
+	ArrayOp operation{memory.size, access.isLoad, ArrayOp::TypedUnknown};
+	operation.inferred = true;
+	switch (id) {
+	case X86_INS_MOVSX: case X86_INS_MOVSXD:
+		if (!access.isLoad || access.value.size != 8) return std::nullopt;
+		operation.arrType = ArrayOp::TypedSigned;
+		break;
+	case X86_INS_MOVZX:
+		if (!access.isLoad || access.value.size < 4) return std::nullopt;
+		operation.arrType = ArrayOp::TypedUnsigned;
+		break;
+	case X86_INS_MOV:
+		if (memory.size == dart::kCompressedWordSize) operation.arrType = ArrayOp::Unknown;
+		break;
+	case X86_INS_MOVSS: case X86_INS_MOVSD:
+		break;
+	default: return std::nullopt;
+	}
+	return operation;
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(InsnCursor& insn)
+{
+	const auto access = getMemoryAccess(*insn.Current());
+	if (!access || access->memory.mem.segment != X86_REG_INVALID)
+		return nullptr;
+	const auto& memory = access->memory;
+	const Reg base{memory.mem.base}, value{access->value.type == X86_OP_REG ? access->value.reg : X86_REG_INVALID};
+	if (!base.IsSet())
+		return nullptr;
+	auto* cls = objects[base];
+	if (auto operation = elementOperation(*access, *insn.Current())) {
+		const auto payload = operation->arrType == ArrayOp::List ? dart::Array::data_offset() :
+			!operation->inferred ? dart::UntaggedTypedData::payload_offset() : memory.mem.disp + dart::kHeapObjectTag;
+		if (auto index = getElementIndex(memory, payload, *operation)) {
+			if (access->isLoad)
+				return std::make_unique<LoadArrayElementInstr>(insn.Range(), value, base, *index, *operation);
+			if (access->value.type == X86_OP_IMM)
+				return std::make_unique<StoreArrayElementInstr>(insn.Range(), access->value.imm, base, *index, *operation);
+			return std::make_unique<StoreArrayElementInstr>(insn.Range(), value, base, *index, *operation);
+		}
+	}
+	if (!isMemoryOperand(memory, memory.mem.base) ||
+		(memory.size != 8 && memory.size != dart::kCompressedWordSize))
+		return nullptr;
+	const auto offset = memory.mem.disp + dart::kHeapObjectTag;
+	if (offset < dart::kWordSize || offset > UINT32_MAX)
+		return nullptr;
+	if (cls && offset < cls->Size() && cls->FindField(offset))
+		return fieldAccess(insn, *access, offset, FieldAccessEvidence::ReceiverLayout);
+	// ARM64's fixed-offset fallback: a slot, not a declaration. A known
+	// layout may veto it; native values and VM state cannot be receivers.
+	if (insn.Current()->id != X86_INS_MOV && insn.Current()->id != X86_INS_MOVSD)
+		return nullptr;
+	if (!isObjectBase(memory.mem.base) || offset % dart::kCompressedWordSize)
+		return nullptr;
+	if (cls) {
+		// Native VM classes may have a negative next-field sentinel (_Map,
+		// _Set). Only their fixed instance extent is a valid fallback bound;
+		// variable-size/unknown extents still cannot justify a field access.
+		const auto size = cls->Size() >= 0 ? cls->Size() :
+			dart::Class::Handle(cls->Ptr()).host_instance_size();
+		if (size <= 0 || offset >= size || cls->Id() == dart::kSmiCid) return nullptr;
+	}
+	return fieldAccess(insn, *access, offset, FieldAccessEvidence::TaggedAddress);
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::fieldAccess(InsnCursor& insn, const MemoryAccess& access,
+	uint32_t offset, FieldAccessEvidence evidence)
+{
+	const Reg base{access.memory.mem.base};
+	if (access.isLoad) {
+		auto load = std::make_unique<LoadFieldInstr>(insn.Range(), Reg{access.value.reg}, base, offset, evidence);
+		load->accessSize = access.memory.size;
+		return load;
+	}
+	std::unique_ptr<StoreFieldInstr> store;
+	if (access.value.type == X86_OP_IMM)
+		store = std::make_unique<StoreFieldInstr>(insn.Range(), access.value.imm, base, offset, evidence);
+	else
+		store = std::make_unique<StoreFieldInstr>(insn.Range(), Reg{access.value.reg}, base, offset, evidence);
+	store->accessSize = access.memory.size;
+	return store;
+}
+
+bool FunctionAnalyzer::isObjectBase(x86_reg base) const
+{
+	const Reg reg{base};
+	if (!reg.IsSet() || int(reg) >= dart::kNumberOfCpuRegisters)
+		return false;
+	if (isVmStateRegister(reg) || nonObjects[reg])
+		return false;
+	return (dart::kDartAvailableCpuRegs & (1 << int(reg))) != 0;
+}
+
+
+
 // SDK: vm/compiler/backend/il_x64.cc, UnboxedConstantInstr::EmitNativeCode.
 // MOVSS/MOVSD proves the scalar width. XORPS/XORPD alone also occurs in vector
 // code and does not establish a Dart double constant.
@@ -1057,6 +1547,140 @@ LoadValueInstr* FunctionAnalyzer::previousLoad(uint64_t address)
 	return static_cast<LoadValueInstr*>(previous);
 }
 
+std::pair<Reg, DartClass*> FunctionAnalyzer::objectResult(ILInstr& il)
+{
+	if (il.Kind() == ILInstr::MoveReg) {
+		const auto& move = static_cast<const MoveRegInstr&>(il);
+		return {move.dstReg, objects[move.srcReg]};
+	}
+	if (il.Kind() == ILInstr::LoadValue) {
+		const auto& load = static_cast<const LoadValueInstr&>(il);
+		if (load.val.storage.kind == VarStorage::Immediate)
+			return {load.dstReg, nullptr}; // Native bits do not establish a heap class.
+		auto cid = load.val.Value()->RawTypeId();
+		if (load.val.storage.kind == VarStorage::Pool) {
+			const auto index = PoolIndexFromOffset(load.val.storage.offset);
+			const auto& pool = app.GetObjectPool();
+			cid = dart::kIllegalCid;
+			if (pool.TypeAt(index) == dart::ObjectPool::EntryType::kTaggedObject) {
+				const auto& object = dart::Object::Handle(pool.ObjectAt(index));
+				if (!object.IsSmi())
+					cid = object.GetClassId();
+			}
+		}
+		return {load.dstReg, cid > 0 ? app.FindClass(cid) : nullptr};
+	}
+	if (il.Kind() == ILInstr::AllocateObject) {
+		const auto& allocation = static_cast<const AllocateObjectInstr&>(il);
+		return {allocation.dstReg, &allocation.dartCls};
+	}
+	if (il.Kind() == ILInstr::Call) {
+		auto* fn = static_cast<CallInstr&>(il).GetFunction();
+		if (fn && fn->ReturnType() != dart::kIllegalCid)
+			return {Reg{dart::CallingConventions::kReturnReg}, app.FindClass(fn->ReturnType())};
+		// SDK: stub_code_compiler_x64.cc, GenerateAllocateArrayStub. Both its
+		// fast and runtime slow paths return a tagged Array in this ABI register.
+		if (fn && fn->IsStub()) {
+			if (fn->AsStub()->kind == DartStub::AllocateArrayStub)
+				return {Reg{dart::AllocateArrayABI::kResultReg}, app.FindClass(dart::kArrayCid)};
+			// GenerateAllocateTypedDataArrayStub returns the tagged internal
+			// array on both allocation paths, in AllocateTypedDataArrayABI.
+			switch (fn->AsStub()->kind) {
+			case DartStub::AllocateFloat32ArrayStub: case DartStub::AllocateFloat32ArrayVMStub:
+				return {Reg{dart::AllocateTypedDataArrayABI::kResultReg}, app.FindClass(dart::kTypedDataFloat32ArrayCid)};
+			case DartStub::AllocateFloat64ArrayStub: case DartStub::AllocateFloat64ArrayVMStub:
+				return {Reg{dart::AllocateTypedDataArrayABI::kResultReg}, app.FindClass(dart::kTypedDataFloat64ArrayCid)};
+			default: break;
+			}
+		}
+	}
+	return {};
+}
+
+// SDK: assembler_x64.cc, CompareClassId / LoadClassId. Reuse LoadClassId IL
+// rather than rematching the tags encoding. In the adjacent sequence
+//   cid = LoadClassId(object); cmp cid, expected; jne other
+// only the fallthrough proves equality. Keep CMP/JNE as assembly, and discard
+// this fact at every later control transfer or alternative entry as usual.
+std::pair<Reg, DartClass*> FunctionAnalyzer::classOnFallthrough(size_t branchIndex)
+{
+	if (branchIndex == 0 || data.il_insns.size() < 2)
+		return {};
+	const auto* branch = instructions.Ptr(branchIndex);
+	if (branch->id != X86_INS_JNE || branch->detail->x86.op_count != 1)
+		return {};
+	if (targets.contains(branch->address))
+		return {};
+	const auto& target = branch->detail->x86.operands[0];
+	if (target.type != X86_OP_IMM)
+		return {};
+	if (target.imm <= branch->address + branch->size || !targets.Index(target.imm).has_value())
+		return {}; // Includes a jump to the fallthrough, which proves nothing.
+	const auto* compare = instructions.Ptr(branchIndex - 1);
+	if (compare->id != X86_INS_CMP || compare->detail->x86.op_count != 2)
+		return {};
+	if (targets.contains(compare->address))
+		return {}; // An alternative edge may bypass the class-id load.
+	const auto* previous = data.il_insns[data.il_insns.size() - 2].get();
+	if (previous->Kind() != ILInstr::LoadClassId || previous->End() != compare->address)
+		return {};
+	const auto* load = static_cast<const LoadClassIdInstr*>(previous);
+	if (load->objReg == load->cidReg || isVmStateRegister(load->objReg))
+		return {}; // Loading the id must not have destroyed the object pointer.
+	const auto& left = compare->detail->x86.operands[0];
+	if (!isRegisterOfSize(left, 4) && !isRegisterOfSize(left, 8))
+		return {};
+	if (Reg{left.reg} != load->cidReg)
+		return {};
+	const auto& right = compare->detail->x86.operands[1];
+	if (right.type != X86_OP_IMM || right.imm <= 0)
+		return {};
+	return {load->objReg, app.FindClass(right.imm)};
+}
+
+// Only negative local facts: an observed integer/untagged address must not be
+// reinterpreted as a heap object by the generic fallback. Unknown is not false.
+// This is deliberately not a type/alias engine; joins and transfers forget it.
+void FunctionAnalyzer::updatePointerExclusions(const cs_insn& insn)
+{
+	const auto& x = insn.detail->x86;
+	Reg result;
+	bool excluded = false;
+	if (x.op_count == 2 && x.operands[0].type == X86_OP_REG) {
+		const auto& dst = x.operands[0];
+		const auto& src = x.operands[1];
+		if (dst.access & CS_AC_WRITE)
+			result = Reg{dst.reg};
+		if (isMoveInstruction(insn.id)) {
+			if (dst.size == 4 && dart::kCompressedWordSize == 8)
+				excluded = true;
+			if (src.type == X86_OP_REG) {
+				const Reg source{src.reg};
+				excluded = (dst.size == 4 && dart::kCompressedWordSize == 8) ||
+					(source.IsSet() && (nonObjects[source] || isVmStateRegister(source)));
+			}
+			if (src.type == X86_OP_IMM)
+				excluded = true; // Includes odd native constants; object constants use PP/THR.
+		}
+		if ((insn.id == X86_INS_XOR || insn.id == X86_INS_SUB) && dst.size >= 4)
+			excluded = src.type == X86_OP_REG && src.reg == dst.reg;
+		if (insn.id == X86_INS_LEA || insn.id == X86_INS_MOVSX || insn.id == X86_INS_MOVSXD || insn.id == X86_INS_MOVZX)
+			excluded = true;
+		if (insn.id == X86_INS_SHR || insn.id == X86_INS_SAR || insn.id == X86_INS_SHL || insn.id == X86_INS_SAL)
+			excluded = true;
+	}
+	if (isControlTransfer(insn) || isTrap(insn)) {
+		nonObjects.fill(false);
+		objects.fill(nullptr);
+	}
+	visitWrittenRegisters(insn, [&](Reg reg) {
+		nonObjects[reg] = false;
+		objects[reg] = nullptr;
+	});
+	if (result.IsSet())
+		nonObjects[result] = excluded;
+}
+
 void FunctionAnalyzer::emit(std::unique_ptr<ILInstr> il, size_t begin, size_t end)
 {
 #ifdef HAS_INIT_ASYNC
@@ -1088,6 +1712,14 @@ void FunctionAnalyzer::emit(std::unique_ptr<ILInstr> il, size_t begin, size_t en
 	default:
 		break;
 	}
+	auto result = objectResult(*il);
+	if (il->Kind() == ILInstr::Unknown && end == begin + 1)
+		result = classOnFallthrough(begin);
+	for (size_t i = begin; i < end; ++i)
+		updatePointerExclusions(*instructions.Ptr(i));
+	const auto [resultReg, resultClass] = result;
+	if (resultReg.IsSet())
+		objects[resultReg] = resultClass;
 	data.AddIL(std::move(il));
 }
 
@@ -1273,10 +1905,245 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processTypeTestInstr(InsnCursor& insn
 	return std::make_unique<TestTypeInstr>(insn.Range(), Reg{dart::TypeTestABI::kInstanceReg}, value->ToString());
 }
 
+namespace {
+
+bool readFpuStackMove(InsnCursor& cursor, Reg reg, intptr_t offset, bool store)
+{
+	if (!cursor.Is(X86_INS_MOVUPS, 2))
+		return false;
+	if (cursor.Current()->detail->x86.addr_size != dart::kWordSize)
+		return false;
+	const auto& memory = cursor.Op(store ? 0 : 1);
+	const auto& value = cursor.Op(store ? 1 : 0);
+	if (!isMemoryOperand(memory, X86_REG_RSP, offset) || memory.size != 16)
+		return false;
+	return isRegisterOfSize(value, 16) && Reg{value.reg} == reg;
+}
+
+// The scope's single register list is also the restore contract. FPU
+// stores ascend by register/slot; CPU PUSHes descend by register.
+bool readRegisterList(InsnCursor& cursor, intptr_t area, RegisterSaveScope& scope)
+{
+	for (intptr_t offset = 0; offset < area; offset += 16) {
+		if (!cursor.Is(X86_INS_MOVUPS, 2) || cursor.Op(1).type != X86_OP_REG)
+			return false;
+		const Reg reg{cursor.Op(1).reg};
+		if (!reg.IsDecimal() || (!scope.saves.empty() && reg <= scope.saves.back().second))
+			return false;
+		if (!readFpuStackMove(cursor, reg, offset, true))
+			return false;
+		scope.saves.emplace_back(cursor.Position(), reg);
+		cursor.Next();
+	}
+	while (cursor.Is(X86_INS_PUSH, 1) && isRegisterOfSize(cursor.Op(0), dart::kWordSize)) {
+		const Reg reg{cursor.Op(0).reg};
+		if (!reg.IsSet() || isVmStateRegister(reg))
+			return false;
+		if (!scope.saves.empty() && !scope.saves.back().second.IsDecimal() && reg >= scope.saves.back().second)
+			return false;
+		scope.saves.emplace_back(cursor.Position(), reg);
+		cursor.Next();
+	}
+	return !scope.saves.empty();
+}
+
+// DoubleToIntegerSlowPath moves an unboxed argument if needed, then the
+// tagged recognized-kind enum into its ABI register before the stub invocation.
+// These are bounded argument preparations, not arbitrary skipped instructions.
+bool readDoubleToIntegerArguments(InsnCursor& cursor)
+{
+	if (cursor.Is(X86_INS_MOVAPS, 2)) {
+		if (!isRegisterOfSize(cursor.Op(0), 16) || !isRegisterOfSize(cursor.Op(1), 16))
+			return false;
+		const auto input = Reg::XMM0 + int(dart::DoubleToIntegerStubABI::kInputReg);
+		if (int(Reg{cursor.Op(0).reg}) != input)
+			return false;
+		cursor.Next();
+	}
+	if (!cursor.Is(X86_INS_MOV, 2) || !isSmiTagRegister(cursor.Op(0)) || cursor.Op(0).size == 1)
+		return false;
+	if (Reg{cursor.Op(0).reg} != Reg{dart::DoubleToIntegerStubABI::kRecognizedKindReg})
+		return false;
+	for (auto kind : {dart::MethodRecognizer::kDoubleToInteger,
+		dart::MethodRecognizer::kDoubleFloorToInt, dart::MethodRecognizer::kDoubleCeilToInt}) {
+		if (isImmediateOperand(cursor.Op(1), int64_t(kind) << dart::kSmiTagSize)) {
+			cursor.Next();
+			return true;
+		}
+	}
+	return false;
+}
+
+// ThrowErrorSlowPathCode saves live registers for lazy deopt / exceptions,
+// even though these zero-argument runtimes never return. A restore is not
+// required here. Prove the runtime entry, argc, trampoline and trailing trap;
+// argument pushes to other runtimes remain unclassified.
+bool readThrowingRuntimeCall(InsnCursor& cursor)
+{
+	if (!cursor.RegOp(X86_INS_MOV) || !isRegisterOperand(cursor.Op(0), X86_REG_RBX)) return false;
+	const auto& entry = cursor.Op(1);
+	if (!isMemoryOperand(entry, CSREG_DART_THR) || entry.size != dart::kWordSize ||
+		cursor.Current()->detail->x86.addr_size != dart::kWordSize) return false;
+	if (entry.mem.disp != dart::Thread::ArgumentErrorUnboxedInt64_entry_point_offset() &&
+		entry.mem.disp != dart::Thread::IntegerDivisionByZeroException_entry_point_offset()) return false;
+	cursor.Next();
+	if (!cursor.IsAvailable() || integerConstant(*cursor.Current()) != 0 ||
+		Reg{cursor.Op(0).reg} != Reg{dart::R10}) return false;
+	cursor.Next();
+	if (!cursor.Is(X86_INS_CALL, 1) || cursor.Op(0).size != dart::kWordSize ||
+		cursor.Current()->detail->x86.addr_size != dart::kWordSize ||
+		!isMemoryOperand(cursor.Op(0), CSREG_DART_THR, dart::Thread::call_to_runtime_entry_point_offset()))
+		return false;
+	cursor.Next();
+	return cursor.Is(X86_INS_INT3, 0);
+}
+
+DartFnBase* readSavedStubCall(DartApp& app, InsnCursor& cursor)
+{
+	if (!cursor.Is(X86_INS_CALL, 1)) {
+		auto target = readCodePoolCall(app, cursor);
+		return target ? target->function : nullptr;
+	}
+	const auto& target = cursor.Op(0);
+	if (target.type == X86_OP_IMM)
+		return app.FindFunctionExact(target.imm);
+	return nullptr;
+}
+
+} // namespace
+
+bool FunctionAnalyzer::readRegisterSaveCall(InsnCursor& cursor, const RegisterSaveScope& scope)
+{
+	const auto start = cursor.Position();
+	const bool doubleArguments = readDoubleToIntegerArguments(cursor);
+	if (!doubleArguments)
+		cursor.SetPosition(start);
+	auto leaf = cursor;
+	if (!doubleArguments && processLeafRuntimeCallInstr(leaf)) {
+		cursor.SetPosition(leaf.Position());
+	} else if (cursor.Is(X86_INS_CALL, 1) && isMemoryOperand(cursor.Op(0), CSREG_DART_THR)) {
+		if (doubleArguments || !GetThreadLeafFunction(cursor.Op(0).mem.disp))
+			return false;
+		if (cursor.Current()->detail->x86.addr_size != dart::kWordSize || cursor.Op(0).size != dart::kWordSize)
+			return false;
+	} else {
+		auto* function = readSavedStubCall(app, cursor);
+		if (!function || !function->IsStub())
+			return false;
+		if (doubleArguments && function->AsStub()->kind != DartStub::DoubleToIntegerVMStub)
+			return false;
+	}
+	cursor.Next();
+	if (!cursor.Is(X86_INS_MOV, 2) || !isRegisterOfSize(cursor.Op(0), dart::kWordSize))
+		return true;
+	const Reg result{cursor.Op(0).reg};
+	if (!isRegisterOperand(cursor.Op(1), X86_REG_RAX) || isVmStateRegister(result))
+		return false;
+	if (std::any_of(scope.saves.begin(), scope.saves.end(), [&](const auto& saved) { return saved.second == result; }))
+		return false;
+	cursor.Next();
+	return true;
+}
+
+namespace {
+bool readSavedRegisters(InsnCursor& cursor, RegisterSaveScope& scope)
+{
+	// CPU restores reverse the pushes; FPU restores preserve slot order.
+	for (auto it = scope.saves.rbegin(); it != scope.saves.rend(); ++it) {
+		const auto reg = it->second;
+		if (reg.IsDecimal()) continue;
+		if (!cursor.Is(X86_INS_POP, 1) || !isRegisterOfSize(cursor.Op(0), dart::kWordSize) || Reg{cursor.Op(0).reg} != reg)
+			return false;
+		scope.restores.emplace_back(cursor.Position(), reg);
+		cursor.Next();
+	}
+	intptr_t offset = 0;
+	for (const auto& [position, reg] : scope.saves) {
+		if (!reg.IsDecimal()) break;
+		if (!readFpuStackMove(cursor, reg, offset, false)) return false;
+		scope.restores.emplace_back(cursor.Position(), reg);
+		offset += 16;
+		cursor.Next();
+	}
+	return true;
+}
+
+} // namespace
+
+// SDK SaveLiveRegisters / allocation slow paths: verify every slot against
+// its restore, the intervening call and the exact stack area release.
+std::optional<RegisterSaveScope> FunctionAnalyzer::readRegisterSaveScope(size_t start)
+{
+	InsnCursor cursor{instructions, targets, start};
+	intptr_t area = 0;
+	if (cursor.Is(X86_INS_SUB, 2)) {
+		if (!isRegisterOperand(cursor.Op(0), X86_REG_RSP) || cursor.Op(1).type != X86_OP_IMM)
+			return std::nullopt;
+		area = cursor.Op(1).imm;
+		if (area <= 0 || area > 16 * 16 || area % 16)
+			return std::nullopt;
+		cursor.Next();
+	} else if (!cursor.Is(X86_INS_PUSH, 1)) {
+		return std::nullopt;
+	}
+	RegisterSaveScope scope{start, 0, {}, {}};
+	if (!readRegisterList(cursor, area, scope))
+		return std::nullopt;
+	auto terminal = cursor;
+	if (readThrowingRuntimeCall(terminal)) {
+		scope.release = terminal.Position();
+		return scope;
+	}
+	if (!readRegisterSaveCall(cursor, scope) || !readSavedRegisters(cursor, scope))
+		return std::nullopt;
+	if (!area) {
+		scope.release = cursor.Position() - 1;
+		return scope;
+	}
+	if (!cursor.Is(X86_INS_ADD, 2) || !isRegisterOperand(cursor.Op(0), X86_REG_RSP))
+		return std::nullopt;
+	if (!isImmediateOperand(cursor.Op(1), area))
+		return std::nullopt;
+	scope.release = cursor.Position();
+	return scope;
+}
+
+// A complete scope is decoded once at its first instruction, then reused
+// while the forward analyzer visits each save/restore. Failed lists cannot
+// restart at a suffix. This replaces repeated bounded backward rescans.
+std::unique_ptr<ILInstr> FunctionAnalyzer::processRegisterSaveInstr(InsnCursor& insn)
+{
+	const auto position = insn.Position();
+	if (!registerSave || position > registerSave->release) {
+		if (!insn.Is(X86_INS_SUB, 2) && !insn.Is(X86_INS_PUSH, 1))
+			return nullptr;
+		if (position && (instructions.Ptr(position - 1)->id == X86_INS_PUSH ||
+			instructions.Ptr(position - 1)->id == X86_INS_MOVUPS))
+			return nullptr;
+		registerSave = readRegisterSaveScope(position);
+	}
+	if (!registerSave)
+		return nullptr;
+	const auto& scope = *registerSave;
+	const auto at = position == scope.allocation ? scope.saves.front().first : position;
+	for (const auto& [saved, reg] : scope.saves) {
+		if (saved != at) continue;
+		insn.SetPosition(saved);
+		return std::make_unique<SaveRegisterInstr>(insn.Range(), reg);
+	}
+	for (const auto& [restored, reg] : scope.restores) {
+		if (restored != position) continue;
+		if (restored == scope.restores.back().first) insn.SetPosition(scope.release);
+		return std::make_unique<RestoreRegisterInstr>(insn.Range(), reg);
+	}
+	return nullptr;
+}
+
 const FunctionAnalyzer::Matcher FunctionAnalyzer::matcherFns[] = {
 	&FunctionAnalyzer::processGdtCallInstr,
 	&FunctionAnalyzer::processEnterFrameInstr,
 	&FunctionAnalyzer::processLeaveFrameInstr,
+	&FunctionAnalyzer::processRegisterSaveInstr,
 	&FunctionAnalyzer::processAllocateStackInstr,
 	&FunctionAnalyzer::processCheckStackOverflowInstr,
 	&FunctionAnalyzer::processReturnInstr,
@@ -1290,14 +2157,18 @@ const FunctionAnalyzer::Matcher FunctionAnalyzer::matcherFns[] = {
 #endif
 	&FunctionAnalyzer::processCallInstr,
 	&FunctionAnalyzer::processTailCallInstr,
+	&FunctionAnalyzer::processLeafRuntimeCallInstr,
 	&FunctionAnalyzer::processRegisterCallInstr,
 	&FunctionAnalyzer::processTypeTestInstr,
+	&FunctionAnalyzer::processBarrierStore,
+	&FunctionAnalyzer::processWriteBarrierInstr,
 	&FunctionAnalyzer::processClassIdMayBeSmiInstr,
 	&FunctionAnalyzer::processBranchIfSmiInstr,
 	&FunctionAnalyzer::processLoadFieldTableInstr,
 #if !defined(DART_COMPRESSED_POINTERS)
 	&FunctionAnalyzer::processUnboxIntInstr,
 #endif
+	&FunctionAnalyzer::processLoadStore,
 	&FunctionAnalyzer::processLoadDoubleInstr,
 	&FunctionAnalyzer::processStorePoolInstr,
 	&FunctionAnalyzer::processLoadValueInstr,
@@ -1311,8 +2182,19 @@ const FunctionAnalyzer::Matcher FunctionAnalyzer::matcherFns[] = {
 void FunctionAnalyzer::asm2il()
 {
 	prepareInstructions();
+	if (function.Ptr() != dart::Function::null()) {
+		const auto& vm = dart::Function::Handle(function.Ptr());
+		// FlowGraphCompiler::EmitStaticCall loads ARGS_DESC_REG exactly when
+		// PrologueNeedsArgumentsDescriptor. Saved descriptors are excluded.
+		if (!dart::FunctionType::Handle(vm.signature()).IsNull() && vm.PrologueNeedsArgumentsDescriptor())
+			objects[Reg{dart::ARGS_DESC_REG}] = app.FindClass(dart::kArrayCid);
+	}
 	for (size_t i = 0; i < instructions.Count();) {
 		auto* current = instructions.Ptr(i);
+		if (targets.contains(current->address)) {
+			objects.fill(nullptr);
+			nonObjects.fill(false);
+		}
 		std::unique_ptr<ILInstr> il;
 		size_t end = i + 1;
 		for (auto matcher : matcherFns) {

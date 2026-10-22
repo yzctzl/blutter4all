@@ -459,6 +459,9 @@ struct ArrayOp {
 	uint8_t size;
 	bool isLoad; // else isStore
 	ArrayType arrType;
+	// Index registers have different units in SDK ElementAddressForRegIndex.
+	bool indexUnboxed{ false };
+	bool inferred{ false }; // Address shape, without an exact receiver layout.
 
 	ArrayOp() : size(0), isLoad(false), arrType(Unknown) {}
 	ArrayOp(uint8_t size, bool isLoad, ArrayType arrType) : size(size), isLoad(isLoad), arrType(arrType) {}
@@ -493,7 +496,8 @@ public:
 	LoadArrayElementInstr& operator=(const LoadArrayElementInstr&) = delete;
 
 	virtual std::string ToString() {
-		return std::format("ArrayLoad: {} = {}[{}]  ; {}", dstReg.Name(), arrReg.Name(), idx.Name(), arrayOp.ToString());
+		return std::format("ArrayLoad: {} = {}[{}]  ; {}{}{}", dstReg.Name(), arrReg.Name(), idx.Name(), arrayOp.ToString(),
+			arrayOp.indexUnboxed ? ", unboxed index" : "", arrayOp.inferred ? ", inferred" : "");
 	}
 
 	CpuRegister dstReg;
@@ -506,54 +510,76 @@ class StoreArrayElementInstr : public ILInstr {
 public:
 	StoreArrayElementInstr(AddrRange addrRange, CpuRegister valReg, CpuRegister arrReg, VarStorage idx, ArrayOp arrayOp)
 		: ILInstr(StoreArrayElement, addrRange), valReg(valReg), arrReg(arrReg), idx(idx), arrayOp(arrayOp) {}
+	StoreArrayElementInstr(AddrRange addrRange, int64_t value, CpuRegister arrReg, VarStorage idx, ArrayOp arrayOp)
+		: ILInstr(StoreArrayElement, addrRange), arrReg(arrReg), idx(idx), arrayOp(arrayOp), immediate(value) {}
 	StoreArrayElementInstr() = delete;
 	StoreArrayElementInstr(StoreArrayElementInstr&&) = delete;
 	StoreArrayElementInstr& operator=(const StoreArrayElementInstr&) = delete;
 
 	virtual std::string ToString() {
-		return std::format("ArrayStore: {}[{}] = {}  ; {}", arrReg.Name(), idx.Name(), valReg.Name(), arrayOp.ToString());
+		const auto value = immediate ? std::format("{:#x}", *immediate) : valReg.Name();
+		return std::format("ArrayStore: {}[{}] = {}  ; {}{}{}", arrReg.Name(), idx.Name(), value, arrayOp.ToString(),
+			arrayOp.indexUnboxed ? ", unboxed index" : "", arrayOp.inferred ? ", inferred" : "");
 	}
 
 	CpuRegister valReg;
 	CpuRegister arrReg;
 	VarStorage idx;
 	ArrayOp arrayOp;
+	std::optional<int64_t> immediate;
 };
+
+enum class FieldAccessEvidence { Unspecified, ReceiverLayout, WriteBarrier, TaggedAddress };
 
 class LoadFieldInstr : public ILInstr {
 public:
-	LoadFieldInstr(AddrRange addrRange, CpuRegister dstReg, CpuRegister objReg, uint32_t offset)
-		: ILInstr(LoadField, addrRange), dstReg(dstReg), objReg(objReg), offset(offset) {}
+	// Offset from the untagged object, as in DartField::Offset / FieldAddress.
+	// A tagged-pointer memory displacement must add kHeapObjectTag first.
+	LoadFieldInstr(AddrRange addrRange, CpuRegister dstReg, CpuRegister objReg, uint32_t offset,
+		FieldAccessEvidence evidence = FieldAccessEvidence::Unspecified)
+		: ILInstr(LoadField, addrRange), dstReg(dstReg), objReg(objReg), offset(offset), evidence(evidence) {}
 	LoadFieldInstr() = delete;
 	LoadFieldInstr(LoadFieldInstr&&) = delete;
 	LoadFieldInstr& operator=(const LoadFieldInstr&) = delete;
 
 	virtual std::string ToString() {
-		return std::format("LoadField: {} = {}->field_{:x}", dstReg.Name(), objReg.Name(), offset);
+		return std::format("LoadField: {} = {}->field_{:x}{}", dstReg.Name(), objReg.Name(), offset,
+			evidence == FieldAccessEvidence::TaggedAddress ? " ; inferred" : "");
 	}
 
 	CpuRegister dstReg;
 	CpuRegister objReg;
 	uint32_t offset;
+	FieldAccessEvidence evidence;
+	uint8_t accessSize{ 0 };
 };
 
 class StoreFieldInstr : public ILInstr {
 public:
-	StoreFieldInstr(AddrRange addrRange, CpuRegister valReg, CpuRegister objReg, uint32_t offset)
-		: ILInstr(StoreField, addrRange), valReg(valReg), objReg(objReg), offset(offset) {}
+	StoreFieldInstr(AddrRange addrRange, CpuRegister valReg, CpuRegister objReg, uint32_t offset,
+		FieldAccessEvidence evidence = FieldAccessEvidence::Unspecified)
+		: ILInstr(StoreField, addrRange), valReg(valReg), objReg(objReg), offset(offset), evidence(evidence) {}
 	StoreFieldInstr(cs_insn* insn, CpuRegister valReg, CpuRegister objReg, uint32_t offset)
 		: ILInstr(StoreField, insn), valReg(valReg), objReg(objReg), offset(offset) {}
+	StoreFieldInstr(AddrRange addrRange, int64_t value, CpuRegister objReg, uint32_t offset,
+		FieldAccessEvidence evidence)
+		: ILInstr(StoreField, addrRange), objReg(objReg), offset(offset), evidence(evidence), immediate(value) {}
 	StoreFieldInstr() = delete;
 	StoreFieldInstr(StoreFieldInstr&&) = delete;
 	StoreFieldInstr& operator=(const StoreFieldInstr&) = delete;
 
 	virtual std::string ToString() {
-		return std::format("StoreField: {}->field_{:x} = {}", objReg.Name(), offset, valReg.Name());
+		const auto value = immediate ? std::format("{:#x}", *immediate) : valReg.Name();
+		return std::format("StoreField: {}->field_{:x} = {}{}", objReg.Name(), offset, value,
+			evidence == FieldAccessEvidence::TaggedAddress ? " ; inferred" : "");
 	}
 
 	CpuRegister valReg;
 	CpuRegister objReg;
 	uint32_t offset;
+	FieldAccessEvidence evidence{ FieldAccessEvidence::Unspecified };
+	uint8_t accessSize{ 0 };
+	std::optional<int64_t> immediate;
 };
 
 class InitLateStaticFieldInstr : public ILInstr {

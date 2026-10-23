@@ -412,13 +412,13 @@ std::unique_ptr<EnterFrameInstr> FunctionAnalyzer::processEnterFrameInstr(AsmIte
 std::unique_ptr<LeaveFrameInstr> FunctionAnalyzer::processLeaveFrameInstr(AsmIterator& insn)
 {
 	if (insn.id() == ARM64_INS_MOV && insn.ops(0).reg == CSREG_DART_SP && insn.ops(1).reg == CSREG_DART_FP) {
+		InsnMarker marker(insn);
 		INSN_ASSERT(fnInfo->useFramePointer);
-		const auto ins0_addr = insn.address();
 		++insn;
 		if (!tryConsumeLeaveFrameRestore(insn))
 			return nullptr;
 
-		return std::make_unique<LeaveFrameInstr>(insn.Wrap(ins0_addr));
+		return std::make_unique<LeaveFrameInstr>(insn.Wrap(marker.Take()));
 	}
 	return nullptr;
 }
@@ -536,9 +536,11 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 				INSN_ASSERT(GetThreadLeafFunction(thr_offset));
 
 				// remove previous EnterFrame
+				const auto start = fnInfo->LastIL()->Start();
 				fnInfo->RemoveLastIL();
 
-				return std::make_unique<CallLeafRuntimeInstr>(insn.Wrap(marker.Take()), thr_offset);
+				marker.Take();
+				return std::make_unique<CallLeafRuntimeInstr>(insn.Wrap(start), thr_offset);
 			}
 		}
 	}
@@ -744,11 +746,20 @@ void FunctionAnalyzer::handlePrologue(AsmIterator& insn, uint64_t endPrologueAdd
 		try {
 			auto il = processPrologueParametersInstr(insn, endPrologueAddr);
 			if (il) {
-				fnInfo->AddIL(std::move(il));
 				hasPrologue = true;
+				// Initializers may be interleaved with parameter setup. Emit them
+				// in address order, splitting setup rather than covering bytes twice.
+				auto next = il->Start();
 				for (auto& pending_il : fnInfo->Vars()->pending_ils) {
+					if (next < pending_il->Start())
+						fnInfo->AddIL(std::make_unique<SetupParametersInstr>(
+							AddrRange(next, pending_il->Start()), &fnInfo->params));
+					next = pending_il->End();
 					fnInfo->AddIL(std::move(pending_il));
 				}
+				if (next < il->End())
+					fnInfo->AddIL(std::make_unique<SetupParametersInstr>(
+						AddrRange(next, il->End()), &fnInfo->params));
 				fnInfo->Vars()->pending_ils.clear();
 			}
 		}
@@ -1708,7 +1719,7 @@ std::unique_ptr<SetupParametersInstr> FunctionAnalyzer::processPrologueParameter
 	// - PrologueBuilder::BuildTypeArgumentsHandling()
 	// this function is only called at prologue state
 	// some variable initialization might be inserted into between prologue instructions.
-	//   these ILs will be appended after Prologue IL even the assembly is before the prologue ends
+	//   handlePrologue emits these ILs between the parameter setup spans.
 	// Note: with method extractors optmization (since Dart 3.4), arguments might pass via registers (R1, R2, R3).
 	//   now, only see in closure and async method.
 	// since Dart 3.5, compiler does not generate decompress pointer instruction for small int (such as parameter count)

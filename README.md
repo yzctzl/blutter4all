@@ -97,10 +97,12 @@ python blutter.py path\to\lib\arm64-v8a build\vs --vs-sln
 - Reading iOS binary
 - Input as apk or ipa
 
-### Desktop x64 snapshots
+### x64 and Linux ARM64 snapshots
 
-The x64 backend accepts Windows/Linux ELF AOT snapshots and macOS x64
-Mach-O snapshot dylibs. Loading is offline and does not run target code.
+The x64 backend accepts Android/Windows/Linux ELF AOT snapshots and macOS x64
+Mach-O snapshot dylibs, with compressed or uncompressed pointers as specified
+by the snapshot. Linux ARM64 ELF snapshots use the existing ARM64 backend.
+Loading is offline and does not run target code.
 PE AOT snapshots and arm64e remain deferred.
 
 Format detection uses file contents, not filename extensions. ELF input must
@@ -117,6 +119,7 @@ binary, select x64 explicitly:
 ```sh
 python blutter.py path/to/windows-or-linux-app output
 python blutter.py path/to/Example.app output --arch x64
+python blutter.py path/to/android.apk output --arch x64
 ```
 
 With only the AOT binary available, specify the matching SDK and target:
@@ -134,7 +137,8 @@ calls, static fields, class IDs, integer unboxing, and object/array accesses
 where the base type is known. Other instructions retain their original assembly;
 ARM64 pattern coverage is broader. The Frida template currently requires ARM64
 with compressed pointers. Real Windows/Linux ELF and macOS universal Mach-O
-samples have been exercised on a Linux x64 host; native Windows/macOS host
+samples, Android x64 (Dart 3.10.8), and Linux ARM64 (Dart 3.5.4) have been
+exercised on a Linux x64 host; native Windows/macOS host
 builds have not been validated for this change.
 
 ### Android ARMv7 snapshots

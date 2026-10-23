@@ -28,6 +28,11 @@ bool isRegisterOfSize(const cs_x86_op& op, uint8_t size)
 	return op.type == X86_OP_REG && op.size == size;
 }
 
+bool isTaggedRegister(const cs_x86_op& op)
+{
+	return isRegisterOfSize(op, dart::kWordSize) || isRegisterOfSize(op, dart::kCompressedWordSize);
+}
+
 bool isImmediateOperand(const cs_x86_op& op, int64_t value)
 {
 	return op.type == X86_OP_IMM && op.imm == value;
@@ -576,10 +581,8 @@ private:
 	std::unique_ptr<ILInstr> processReturnInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processGdtCallInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processTryAllocateObject(InsnCursor& insn);
-#if !defined(DART_COMPRESSED_POINTERS)
 	std::unique_ptr<ILInstr> processBoxInt64Instr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processUnboxIntInstr(InsnCursor& insn);
-#endif
 	std::unique_ptr<ILInstr> processClosureCallInstr(InsnCursor& insn);
 #ifndef NO_INIT_LATE_STATIC_FIELD
 	std::unique_ptr<ILInstr> processInitLateStaticFieldInstr(InsnCursor& insn);
@@ -801,7 +804,6 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processTryAllocateObject(InsnCursor& 
 	return std::make_unique<AllocateObjectInstr>(insn.Range(), Reg{instance}, *cls);
 }
 
-#if !defined(DART_COMPRESSED_POINTERS)
 // SDK: vm/compiler/backend/il_x64.cc, BoxInt64Instr::EmitNativeCode;
 // assembler_x64.h, SmiTag. ADD alone does not prove Smi tagging.
 //   mov rax, value; add rax, rax; jno done
@@ -811,6 +813,35 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processTryAllocateObject(InsnCursor& 
 // the checked 2.19.6 shared slow path does not emit that frame.
 std::unique_ptr<ILInstr> FunctionAnalyzer::processBoxInt64Instr(InsnCursor& insn)
 {
+#if defined(DART_COMPRESSED_POINTERS)
+	// Compressed Smis carry 30 value bits. LEA tags without flags; the
+	// shifted source must be in [-1, 0], proven by the unsigned range test.
+	if (!insn.RegOp(X86_INS_LEA) || !isRegisterOperand(insn.Op(0), X86_REG_RAX))
+		return nullptr;
+	const auto& address = insn.Op(1);
+	if (address.type != X86_OP_MEM || insn.Current()->detail->x86.addr_size != 8)
+		return nullptr;
+	const auto source = address.mem.base;
+	if (!Reg{source}.IsSet() || source == X86_REG_RAX || address.mem.index != source)
+		return nullptr;
+	if (address.mem.scale != 1 || address.mem.disp != 0 || address.mem.segment != X86_REG_INVALID)
+		return nullptr;
+	insn.Next();
+	if (!insn.RegOp(X86_INS_MOV) || !isRegisterOperand(insn.Op(1), source))
+		return nullptr;
+	const auto temporary = insn.Op(0).reg;
+	if (temporary == source || temporary == X86_REG_RAX)
+		return nullptr;
+	insn.Next();
+	for (const auto& [operation, immediate] : {std::pair{X86_INS_SAR, dart::kSmiBits},
+		std::pair{X86_INS_ADD, intptr_t{1}}, std::pair{X86_INS_CMP, intptr_t{2}}}) {
+		if (!insn.RegOp(operation) || !insn.Immediate(operation, temporary, immediate))
+			return nullptr;
+		insn.Next();
+	}
+	if (!insn.Branch(X86_INS_JB))
+		return nullptr;
+#else
 	if (!insn.Is(X86_INS_MOV, 2) || !isRegisterOperand(insn.Op(0), X86_REG_RAX))
 		return nullptr;
 	if (insn.Op(0).size != 8 || !isRegisterOfSize(insn.Op(1), 8))
@@ -826,6 +857,7 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processBoxInt64Instr(InsnCursor& insn
 	insn.Next();
 	if (!insn.Branch(X86_INS_JNO))
 		return nullptr;
+#endif
 	const auto join = static_cast<uint64_t>(insn.Op(0).imm);
 	insn.Next();
 
@@ -877,6 +909,20 @@ std::unique_ptr<UnboxIntInstr> readUnboxInt(InsnCursor& insn)
 		source = Reg{insn.Op(1).reg};
 		insn.Next();
 	}
+#if defined(DART_COMPRESSED_POINTERS)
+	// Keep the full heap pointer alive while sign-extending the 32-bit Smi.
+	// A same-register result is first copied to TMP by the SDK helper.
+	if (!insn.RegOp(X86_INS_MOVSXD) || !isRegisterOfSize(insn.Op(1), 4))
+		return nullptr;
+	const Reg boxed{insn.Op(1).reg};
+	if (boxed == Reg{insn.Op(0).reg} ||
+		(destination != X86_REG_INVALID && boxed != Reg{destination}))
+		return nullptr;
+	if (!source.IsSet())
+		source = boxed;
+	destination = insn.Op(0).reg;
+	insn.Next();
+#endif
 	if (!insn.RegOp(X86_INS_SAR))
 		return nullptr;
 	if (!isImmediateOperand(insn.Op(1), dart::kSmiTagSize))
@@ -897,14 +943,20 @@ std::unique_ptr<UnboxIntInstr> readUnboxInt(InsnCursor& insn)
 	if (!isRegisterOperand(insn.Op(0), destination) || insn.Op(0).size != 8)
 		return nullptr;
 	const auto& value = insn.Op(1);
-	if (value.type != X86_OP_MEM)
+	if (value.type != X86_OP_MEM || insn.Current()->detail->x86.addr_size != dart::kWordSize)
 		return nullptr;
+#if defined(DART_COMPRESSED_POINTERS)
+	if (Reg{value.mem.base} != boxed || !isMemoryOperand(value, value.mem.base,
+		dart::Mint::value_offset() - dart::kHeapObjectTag))
+		return nullptr;
+#else
 	if (value.mem.base != destination || value.mem.index != destination)
 		return nullptr;
 	if (value.mem.scale != 1 || value.mem.segment != X86_REG_INVALID)
 		return nullptr;
 	if (value.mem.disp != dart::Mint::value_offset())
 		return nullptr;
+#endif
 	if (join != insn.Current()->address + insn.Current()->size)
 		return nullptr;
 
@@ -915,7 +967,6 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processUnboxIntInstr(InsnCursor& insn
 {
 	return readUnboxInt(insn);
 }
-#endif
 
 // SDK: vm/compiler/backend/il_x64.cc, ClosureCallInstr::EmitNativeCode;
 // vm/dart_entry.h, ArgumentsDescriptor. Reuse preceding LoadValue IL like ARM64.
@@ -1555,6 +1606,17 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadValueInstr(InsnCursor& ins
 		VarItem{VarStorage::NewPool(offset), getPoolObject(app, offset, dst)});
 }
 
+#if defined(DART_COMPRESSED_POINTERS)
+// Assembler::LoadCompressed restores the heap base after a zero-extending load.
+bool isDecompression(const cs_insn& insn)
+{
+	const auto& x = insn.detail->x86;
+	return insn.id == X86_INS_ADD && x.op_count == 2 && x.addr_size == dart::kWordSize &&
+		isRegisterOfSize(x.operands[0], dart::kWordSize) && x.operands[1].size == dart::kWordSize &&
+		isMemoryOperand(x.operands[1], CSREG_DART_THR, AOT_Thread_heap_base_offset);
+}
+#endif
+
 // StoreWordToPoolIndex uses the same tagged PP displacement convention as its
 // load counterpart. Keep a distinct IL kind; this is not a LoadValue object.
 std::unique_ptr<ILInstr> FunctionAnalyzer::processStorePoolInstr(InsnCursor& insn)
@@ -1585,9 +1647,7 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processMoveRegInstr(InsnCursor& insn)
 #if defined(DART_COMPRESSED_POINTERS)
 std::unique_ptr<ILInstr> FunctionAnalyzer::processDecompressPointerInstr(InsnCursor& insn)
 {
-	if (!insn.RegOp(X86_INS_ADD))
-		return nullptr;
-	if (!isMemoryOperand(insn.Op(1), CSREG_DART_THR, AOT_Thread_heap_base_offset))
+	if (!insn.IsAvailable() || !isDecompression(*insn.Current()))
 		return nullptr;
 	return std::make_unique<DecompressPointerInstr>(insn.Range(), VarStorage{Reg{insn.Op(0).reg}});
 }
@@ -2248,7 +2308,7 @@ public:
 	void Recover();
 
 private:
-	enum Kind { Unknown, ZeroIndex, NullValue, Descriptor, Count, OptionalCount, DescriptorSize, TypeArgsLength, DescriptorName, Position, CountMinusPosition,
+	enum Kind { Unknown, ZeroIndex, NullValue, Descriptor, Count, OptionalCount, DescriptorSize, TypeArgsLength, DescriptorName, Position, CountMinusPosition, CompressedContext,
 		NamedValue, UnboxedNamedValue, IncomingValue, ParameterValue, StackValue, ClosureValue, ContextValue, TypeArgsValue };
 	struct Source {
 		Kind kind{Unknown};
@@ -2592,8 +2652,42 @@ void X64ParameterRecovery::transfer(const cs_insn& insn, Registers& registers, b
 				left.mem.disp >= -frameSize && left.mem.disp % dart::kWordSize == 0)
 				spill = left.mem.disp;
 		}
-		if (insn.id == X86_INS_SUB && isRegisterOfSize(left, dart::kWordSize)) {
-			if (source(left, registers).kind == Count && source(right, registers).kind == Position) {
+#if defined(DART_COMPRESSED_POINTERS)
+		// Descriptor fields use LoadCompressedSmi (MOV32), while names and
+		// closure contexts use LoadCompressed (MOV32 + heap base). Limit this
+		// transfer to proven VM fields; truncated argument pointers do not pass.
+		if (insn.id == X86_INS_MOV && isRegisterOfSize(left, dart::kCompressedWordSize) &&
+			right.type == X86_OP_MEM && right.size == dart::kCompressedWordSize) {
+			const auto input = source(right, registers);
+			if (input.kind == Count || input.kind == DescriptorSize || input.kind == TypeArgsLength ||
+				input.kind == Position || input.kind == DescriptorName || input.kind == ContextValue) {
+				result = input.kind == ContextValue ? Source{CompressedContext} : input;
+				dst = Reg{left.reg};
+			}
+		}
+		// Descriptor arithmetic is on tagged 32-bit counts/positions, then
+		// MOVSXD prepares a native-width stack index. This never propagates an
+		// arbitrary truncated argument or heap pointer as an intact value.
+		if ((insn.id == X86_INS_MOVSXD || insn.id == X86_INS_MOV) &&
+			isRegisterOfSize(right, dart::kCompressedWordSize) && isTaggedRegister(left)) {
+			const auto input = source(right, registers);
+			if (input.kind == Count || input.kind == OptionalCount || input.kind == DescriptorSize ||
+				input.kind == TypeArgsLength || input.kind == Position || input.kind == CountMinusPosition) {
+				result = input;
+				dst = Reg{left.reg};
+			}
+		}
+		if (isDecompression(insn)) {
+			const auto input = source(left, registers);
+			if (input.kind == DescriptorName || input.kind == CompressedContext || input.kind == Position) {
+				result = input.kind == CompressedContext ? Source{ContextValue} : input;
+				dst = Reg{left.reg};
+			}
+		}
+#endif
+		if (insn.id == X86_INS_SUB && isTaggedRegister(left)) {
+			if (source(left, registers).kind == Count && source(right, registers).kind == Position &&
+				left.size == dart::kCompressedWordSize) {
 				result = {CountMinusPosition, source(right, registers).value};
 				dst = Reg{left.reg};
 			}
@@ -2652,7 +2746,7 @@ bool X64ParameterRecovery::parameterMove(const cs_insn& insn, const Registers& r
 bool X64ParameterRecovery::parameterInstruction(const cs_insn& insn, const Registers& registers) const
 {
 	switch (insn.id) {
-	case X86_INS_MOV: case X86_INS_MOVABS: case X86_INS_MOVSD:
+	case X86_INS_MOV: case X86_INS_MOVABS: case X86_INS_MOVSD: case X86_INS_MOVSXD:
 	case X86_INS_MOVAPS: case X86_INS_MOVAPD: case X86_INS_MOVQ: case X86_INS_XCHG:
 	case X86_INS_XORPS: case X86_INS_XORPD: case X86_INS_LEA:
 	case X86_INS_ADD: case X86_INS_SUB: case X86_INS_SHL:
@@ -2734,7 +2828,8 @@ std::optional<std::string> X64ParameterRecovery::comparedName(
 	if (insn.detail->x86.addr_size != dart::kWordSize)
 		return std::nullopt;
 	const auto* ops = insn.detail->x86.operands;
-	if (ops[0].size != dart::kWordSize || ops[1].size != dart::kWordSize)
+	if (ops[0].size != ops[1].size ||
+		(ops[0].size != dart::kWordSize && ops[0].size != dart::kCompressedWordSize))
 		return std::nullopt;
 	for (int i = 0; i < 2; ++i) {
 		const auto entry = source(ops[i], registers);
@@ -2830,7 +2925,6 @@ std::optional<X64ParameterRecovery::NamedResult> X64ParameterRecovery::unusedNam
 bool X64ParameterRecovery::unboxParameter(size_t& index, size_t end, Registers& registers,
 	std::vector<std::pair<size_t, size_t>>& edges)
 {
-#if !defined(DART_COMPRESSED_POINTERS)
 	InsnCursor cursor{instructions, targets, index};
 	auto unbox = readUnboxInt(cursor);
 	if (!unbox || cursor.Position() >= end)
@@ -2844,9 +2938,6 @@ bool X64ParameterRecovery::unboxParameter(size_t& index, size_t end, Registers& 
 	registers[unbox->dstReg] = {UnboxedNamedValue, input.value};
 	index = cursor.Position();
 	return true;
-#else
-	return false;
-#endif
 }
 
 // PrologueBuilder links missing positional arguments through a shared default
@@ -2884,7 +2975,7 @@ std::vector<X64ParameterRecovery::NamedResult> X64ParameterRecovery::parameterDe
 			} else {
 				const auto input = source(x.operands[0], supplied);
 				const auto& threshold = x.operands[1];
-				if (!isRegisterOfSize(x.operands[0], dart::kWordSize) || threshold.type != X86_OP_IMM ||
+				if (!isTaggedRegister(x.operands[0]) || threshold.type != X86_OP_IMM ||
 					threshold.imm < 2 || threshold.imm > 2 * UINT8_MAX || (threshold.imm & 1)) return {};
 				optional = threshold.imm / 2 - 1;
 				if (missing.empty()) { count = input; firstOptional = optional; }
@@ -3183,7 +3274,9 @@ void X64ParameterRecovery::descriptorTypeArguments(size_t begin)
 		visitWrittenRegisters(insn, [&](Reg reg) { writesDescriptor |= reg == Reg{dart::ARGS_DESC_REG}; });
 		if (writesDescriptor)
 			return;
-		if (!isParameterValueMove(insn) || targets.contains(instructions.Ptr(i + 1)->address))
+		if (insn.id != X86_INS_MOV || insn.detail->x86.op_count != 2 ||
+			!isRegisterOfSize(insn.detail->x86.operands[0], dart::kCompressedWordSize) ||
+			targets.contains(instructions.Ptr(i + 1)->address))
 			continue;
 		Registers registers{};
 		registers[Reg{dart::ARGS_DESC_REG}] = {Descriptor};
@@ -3305,9 +3398,7 @@ const FunctionAnalyzer::Matcher FunctionAnalyzer::matcherFns[] = {
 	&FunctionAnalyzer::processCheckStackOverflowInstr,
 	&FunctionAnalyzer::processReturnInstr,
 	&FunctionAnalyzer::processTryAllocateObject,
-#if !defined(DART_COMPRESSED_POINTERS)
 	&FunctionAnalyzer::processBoxInt64Instr,
-#endif
 	&FunctionAnalyzer::processClosureCallInstr,
 #ifndef NO_INIT_LATE_STATIC_FIELD
 	&FunctionAnalyzer::processInitLateStaticFieldInstr,
@@ -3322,9 +3413,7 @@ const FunctionAnalyzer::Matcher FunctionAnalyzer::matcherFns[] = {
 	&FunctionAnalyzer::processClassIdMayBeSmiInstr,
 	&FunctionAnalyzer::processBranchIfSmiInstr,
 	&FunctionAnalyzer::processLoadFieldTableInstr,
-#if !defined(DART_COMPRESSED_POINTERS)
 	&FunctionAnalyzer::processUnboxIntInstr,
-#endif
 	&FunctionAnalyzer::processLoadStore,
 	&FunctionAnalyzer::processLoadDoubleInstr,
 	&FunctionAnalyzer::processStorePoolInstr,

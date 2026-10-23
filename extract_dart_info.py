@@ -8,32 +8,105 @@ import zlib
 from struct import unpack
 
 from elftools.elf.elffile import ELFFile
-from elftools.elf.enums import ENUM_E_MACHINE 
-from elftools.elf.sections import SymbolTableSection
 from macho import MachO, is_macho
 
+def binary_format(path):
+    with open(path, 'rb') as stream:
+        magic = stream.read(4)
+    if magic == b'\x7fELF':
+        return 'elf'
+    if is_macho(path):
+        return 'macho'
+    raise ValueError('Unsupported snapshot format; expected ELF or Mach-O')
+
 def extract_snapshot_hash_flags(libapp_file):
-    if is_macho(libapp_file):
+    if binary_format(libapp_file) == 'macho':
         snapshot_hash, flags, _ = MachO(libapp_file).snapshot_info()
         return snapshot_hash, flags
     with open(libapp_file, 'rb') as f:
         elf = ELFFile(f)
         # find "_kDartVmSnapshotData" symbol
-        dynsym = elf.get_section_by_name('.dynsym')
-        sym = dynsym.get_symbol_by_name('_kDartVmSnapshotData')[0]
-        #section = elf.get_section(sym['st_shndx'])
-        assert sym['st_size'] > 128
+        if not elf.little_endian or elf.header.e_type != 'ET_DYN':
+            raise ValueError('ELF: Expected a little-endian shared snapshot image')
+        segments = sorted((s for s in elf.iter_segments() if s['p_type'] == 'PT_LOAD'
+                           and s['p_memsz']), key=lambda s: s['p_vaddr'])
+        if not segments or segments[0]['p_vaddr'] != 0:
+            raise ValueError('ELF: Expected zero-based snapshot image')
+        f.seek(0, 2)
+        file_size, image_end = f.tell(), 0
+        for s in segments:
+            address, size = s['p_vaddr'], s['p_memsz']
+            if not image_end <= address <= (1 << 30) or size > (1 << 30) - address:
+                raise ValueError('ELF: Overlapping or oversized virtual segments')
+            if (s['p_filesz'] > size or s['p_offset'] > file_size or
+                    s['p_filesz'] > file_size - s['p_offset']):
+                raise ValueError('ELF: Invalid file-backed segment range')
+            image_end = address + size
+        symbols = [sym for section in elf.iter_sections() if section['sh_type'] == 'SHT_DYNSYM'
+                   for sym in section.iter_symbols()
+                   if sym.name == '_kDartVmSnapshotData' and sym['st_shndx'] != 'SHN_UNDEF']
+        if len(symbols) != 1:
+            raise ValueError('ELF: Missing or duplicate VM snapshot data symbol')
+        sym = symbols[0]
         address = sym['st_value']
-        segment = next((s for s in elf.iter_segments() if s['p_type'] == 'PT_LOAD' and
-                        s['p_vaddr'] <= address and address - s['p_vaddr'] + 52 <= s['p_filesz']), None)
+        segment = next((s for s in segments if
+                        s['p_vaddr'] <= address and address - s['p_vaddr'] + 53 <= s['p_filesz']), None)
         if segment is None:
             raise ValueError('ELF snapshot metadata is not file backed')
-        f.seek(segment['p_offset'] + address - segment['p_vaddr'] + 20)
-        snapshot_hash = f.read(32).decode()
-        data = f.read(256) # should be enough
-        flags = data[:data.index(b'\0')].decode().strip().split(' ')
+        if address % 16:
+            raise ValueError('ELF: Unaligned snapshot symbol')
+        f.seek(segment['p_offset'] + address - segment['p_vaddr'])
+        header = f.read(52)
+        if len(header) != 52:
+            raise ValueError('ELF: Truncated snapshot header')
+        magic, length = unpack('<IQ', header[:12])
+        remaining = segment['p_filesz'] - (address - segment['p_vaddr'])
+        if magic != 0xdcdcf5f5 or not 49 <= length <= remaining - 4:
+            raise ValueError('ELF: Invalid snapshot header or length')
+        snapshot_hash = header[20:52].decode('ascii')
+        # Read only the flags, bounded by the declared snapshot, rather than
+        # copying the full data image or assuming flags fit in 256 bytes.
+        chunks = []
+        remaining = length + 4 - 52
+        while remaining:
+            data = f.read(min(remaining, 256))
+            if not data:
+                raise ValueError('ELF: Truncated snapshot flags')
+            end = data.find(b'\0')
+            if end >= 0:
+                chunks.append(data[:end])
+                break
+            chunks.append(data)
+            remaining -= len(data)
+        else:
+            raise ValueError('ELF: Unterminated snapshot flags')
+        flags = b''.join(chunks).decode('ascii').split()
     
     return snapshot_hash, flags
+
+def extract_snapshot_target(libapp_file, target_arch=None):
+    if binary_format(libapp_file) == 'macho':
+        image = MachO(libapp_file, target_arch)
+        snapshot_hash, flags, os_name = image.snapshot_info()
+        return snapshot_hash, flags, image.arch, os_name
+    snapshot_hash, flags = extract_snapshot_hash_flags(libapp_file)
+    architectures = [value for value in ('arm64', 'x64', 'arm') if value in flags]
+    platforms = [value for value in ('android', 'linux', 'windows') if value in flags]
+    if len(architectures) != 1 or len(platforms) != 1:
+        raise ValueError('Missing or ambiguous snapshot architecture/platform')
+    arch, os_name = architectures[0], platforms[0]
+    if target_arch not in (None, arch):
+        raise ValueError('Requested architecture does not match snapshot')
+    with open(libapp_file, 'rb') as stream:
+        elf = ELFFile(stream)
+        machine = elf.header.e_machine
+        if elf.elfclass != (32 if arch == 'arm' else 64):
+            raise ValueError('Snapshot word size does not match ELF header')
+    if machine != {'arm64': 'EM_AARCH64', 'x64': 'EM_X86_64', 'arm': 'EM_ARM'}[arch]:
+        raise ValueError('Snapshot architecture does not match ELF header')
+    if arch == 'arm' and 'compressed-pointers' in flags:
+        raise ValueError('ARM32 snapshots cannot use compressed pointers')
+    return snapshot_hash, flags, arch, os_name
 
 def extract_libflutter_info(libflutter_file, target_arch=None):
     if is_macho(libflutter_file):
@@ -53,26 +126,30 @@ def extract_libflutter_info(libflutter_file, target_arch=None):
         elif elf.header.e_machine == 'EM_X86_64': # 62
             arch = 'x64'
         else:
-            assert False, f"Unsupport architecture: {elf.header.e_machine}"
+            raise ValueError(f'Unsupported engine architecture: {elf.header.e_machine}')
 
-        section = elf.get_section_by_name('.rodata')
-        data = section.data()
+        # The engine is not mapped into the VM. Inspect file-backed read-only
+        # segments (including R-X) so discovery does not depend on section names.
+        data = b'\0'.join(segment.data() for segment in elf.iter_segments()
+                          if segment['p_type'] == 'PT_LOAD' and segment['p_flags'] & 4
+                          and not segment['p_flags'] & 2)
+        if not data:
+            raise ValueError('ELF: Missing read-only engine data')
         
         sha_hashes = re.findall(b'\x00([a-f\\d]{40})(?=\x00)', data)
         #print(sha_hashes)
         # all possible engine ids
-        engine_ids = [ h.decode() for h in sha_hashes ]
-        assert len(engine_ids) == 2, f'found hashes {", ".join(engine_ids)}'
+        engine_ids = list(dict.fromkeys(h.decode() for h in sha_hashes))
         
         # beta/dev version of flutter might not use stable dart version (we can get dart version from sdk with found engine_id)
         # support stable, beta and dev channels
-        m = re.search(br'\x00([\d\w\.-]+) \((stable|beta|dev)\)', data)
-        if m is None:
-            dart_version = None
-        else:
-            dart_version = m.group(1).decode()
+        versions = {match[0].decode() for match in re.findall(br'\x00([\d\w\.-]+) \((stable|beta|dev)\)', data)}
+        if len(versions) > 1:
+            raise ValueError('Ambiguous Dart versions in Flutter engine')
+        dart_version = next(iter(versions), None)
         
-    return engine_ids, dart_version, arch, 'android'
+    # ELF itself does not identify Android versus Linux; the snapshot flags do.
+    return engine_ids, dart_version, arch, None
 
 def get_dart_sdk_url_size(engine_ids):
     #url = f'https://storage.googleapis.com/dart-archive/channels/stable/release/3.0.3/sdk/dartsdk-windows-x64-release.zip'
@@ -120,30 +197,15 @@ def get_dart_commit(url):
     return commit_id, dart_version
 
 def extract_dart_info(libapp_file: str, libflutter_file: str, target_arch=None):
-    apple = is_macho(libapp_file)
+    apple = binary_format(libapp_file) == 'macho'
     if apple != is_macho(libflutter_file):
         raise ValueError('App and Flutter engine formats do not match')
-    if apple:
-        image = MachO(libapp_file, target_arch)
-        snapshot_hash, flags, snapshot_os = image.snapshot_info()
-        target_arch = image.arch
-    else:
-        snapshot_hash, flags = extract_snapshot_hash_flags(libapp_file)
+    snapshot_hash, flags, arch, snapshot_os = extract_snapshot_target(libapp_file, target_arch)
     #print('snapshot hash', snapshot_hash)
     #print(flags)
 
     if not apple:
-        architectures = [value for value in ('arm64', 'x64', 'arm') if value in flags]
-        platforms = [value for value in ('android', 'linux', 'windows') if value in flags]
-        if len(architectures) != 1 or len(platforms) != 1:
-            raise ValueError('Missing or ambiguous snapshot architecture/platform')
-        arch, os_name = architectures[0], platforms[0]
-        if target_arch not in (None, arch):
-            raise ValueError('Requested architecture does not match snapshot')
-        with open(libapp_file, 'rb') as stream:
-            machine = ELFFile(stream).header.e_machine
-        if machine != {'arm64': 'EM_AARCH64', 'x64': 'EM_X86_64', 'arm': 'EM_ARM'}[arch]:
-            raise ValueError('Snapshot architecture does not match ELF header')
+        os_name = snapshot_os
         if os_name == 'windows':
             # The engine is PE even when its AOT payload is ELF. Read only
             # embedded SDK metadata; no PE snapshot loading or execution.
@@ -165,7 +227,7 @@ def extract_dart_info(libapp_file: str, libflutter_file: str, target_arch=None):
             if arch != engine_arch:
                 raise ValueError('App and Flutter engine architectures do not match')
     else:
-        engine_ids, dart_version, arch, os_name = extract_libflutter_info(libflutter_file, target_arch)
+        engine_ids, dart_version, arch, os_name = extract_libflutter_info(libflutter_file, arch)
     if apple:
         if os_name not in (None, snapshot_os):
             raise ValueError('App and Flutter engine target platforms do not match')

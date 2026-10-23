@@ -252,7 +252,11 @@ def build_and_run(input: BlutterInput):
 
 def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
     version, os_name, arch = dart_version.split('_')
-    dart_info = DartLibInfo(version, os_name, arch)
+    from extract_dart_info import extract_snapshot_target
+    snapshot_hash, flags, snapshot_arch, snapshot_os = extract_snapshot_target(libapp_path, arch)
+    if snapshot_arch != arch or snapshot_os != os_name:
+        raise ValueError('Specified target does not match snapshot architecture/platform')
+    dart_info = DartLibInfo(version, os_name, arch, 'compressed-pointers' in flags, snapshot_hash)
     input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
     build_and_run(input)
     

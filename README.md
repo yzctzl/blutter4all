@@ -103,6 +103,12 @@ The x64 backend accepts Windows/Linux ELF AOT snapshots and macOS x64
 Mach-O snapshot dylibs. Loading is offline and does not run target code.
 PE AOT snapshots and arm64e remain deferred.
 
+Format detection uses file contents, not filename extensions. ELF input must
+be a zero-based, little-endian shared snapshot image with a dynamic symbol
+table. Mach-O input must be a zero-based 64-bit snapshot dylib with a symbol
+table; both FAT32 and FAT64 universal containers are accepted. Encrypted images
+are rejected. These are offline snapshot readers, not general OS loaders.
+
 Pass an unpacked Windows application directory (`data/app.so` and
 `flutter_windows.dll`), a Linux application directory (`lib/libapp.so` and
 `lib/libflutter_linux_gtk.so`), or a macOS app bundle. For a universal macOS
@@ -118,6 +124,9 @@ With only the AOT binary available, specify the matching SDK and target:
 ```sh
 python blutter.py path/to/app.so output --dart-version 3.11.5_windows_x64
 ```
+
+This option checks the specified target against the snapshot and reads pointer
+compression from its flags; it does not infer the pointer layout from the OS.
 
 The shared snapshot pipeline exports libraries, classes, fields, objects and
 methods. The x64 analyzer recognizes frames, stack checks, pool/thread loads,

@@ -24,6 +24,7 @@ constexpr uint32_t kTargetSubtype = 0;
 #endif
 constexpr uint32_t kMach64 = 0xfeedfacf;
 constexpr uint32_t kFat = 0xcafebabe;
+constexpr uint32_t kFat64 = 0xcafebabf;
 constexpr size_t kAlignment = 0x10000;
 // Bound allocations when inspecting untrusted headers. This is a supported
 // image-size limit, not an inference about a snapshot's validity.
@@ -51,25 +52,32 @@ struct Reader {
 		return uint32_t(b[3]) | uint32_t(b[2]) << 8 | uint32_t(b[1]) << 16 | uint32_t(b[0]) << 24;
 	}
 	uint64_t U64(uint64_t offset) const { return U32(offset) | uint64_t(U32(offset + 4)) << 32; }
+	uint64_t BE64(uint64_t offset) const { return uint64_t(BE32(offset)) << 32 | BE32(offset + 4); }
 };
 
 Reader SelectTarget(Reader file)
 {
-	if (file.BE32(0) != kFat)
+	// Apple cctools include/mach-o/fat.h: FAT64 changes the slice record,
+	// not the Mach-O image's virtual addresses or its internal file offsets.
+	const auto magic = file.BE32(0);
+	if (magic != kFat && magic != kFat64)
 		return file;
+	const bool is64 = magic == kFat64;
+	const uint64_t entrySize = is64 ? 32 : 20;
 	const auto count = file.BE32(4);
-	const uint64_t tableEnd = 8 + uint64_t(count) * 20;
+	const uint64_t tableEnd = 8 + uint64_t(count) * entrySize;
 	file.Range(0, tableEnd);
 	std::span<const uint8_t> selected;
 	for (uint32_t i = 0; i < count; ++i) {
-		const uint64_t at = 8 + uint64_t(i) * 20;
+		const uint64_t at = 8 + uint64_t(i) * entrySize;
 		const auto cpu = file.BE32(at);
 		const auto subtype = file.BE32(at + 4);
-		const auto offset = file.BE32(at + 8);
-		const auto size = file.BE32(at + 12);
-		const auto alignment = file.BE32(at + 16);
+		const uint64_t offset = is64 ? file.BE64(at + 8) : file.BE32(at + 8);
+		const uint64_t size = is64 ? file.BE64(at + 16) : file.BE32(at + 12);
+		const auto alignment = file.BE32(at + (is64 ? 24 : 16));
 		Require(offset >= tableEnd && size != 0, "Invalid universal slice range");
-		Require(alignment < 32 && (uint64_t(offset) % (uint64_t{1} << alignment)) == 0, "Invalid slice alignment");
+		Require(alignment < (is64 ? 64u : 32u) && (offset % (uint64_t{1} << alignment)) == 0, "Invalid slice alignment");
+		Require(!is64 || file.BE32(at + 28) == 0, "Invalid universal slice reserved field");
 		auto slice = file.Range(offset, size);
 		if (cpu == kTargetCpu && (subtype & 0x00ffffff) == kTargetSubtype) {
 			Require(selected.empty(), "Ambiguous target architecture slices");
@@ -116,7 +124,7 @@ LibAppInfo MachOHelper::MapLibApp(const char* path)
 #endif
 	const auto bytes = ReadFile(path);
 	const auto file = SelectTarget(Reader{bytes});
-	Require(file.U32(0) == kMach64, "Expected little-endian Mach-O 64 or FAT32 universal container");
+	Require(file.U32(0) == kMach64, "Expected little-endian Mach-O 64 or universal container");
 	file.Range(0, 32);
 	Require(file.U32(4) == kTargetCpu && (file.U32(8) & 0x00ffffff) == kTargetSubtype, "Expected matching ARM64 or x64 target (arm64e is deferred)");
 	Require(file.U32(12) == 6, "Expected a snapshot dynamic library"); // MH_DYLIB
@@ -130,6 +138,12 @@ LibAppInfo MachOHelper::MapLibApp(const char* path)
 	uint32_t symbolsCount = 0, stringsSize = 0;
 	uint64_t sectionCount = 0;
 	bool hasSymbols = false;
+	uint32_t targetPlatform = 0;
+	const auto setPlatform = [&](uint32_t platform) {
+		Require(platform == 1 || platform == 2, "Expected macOS or iOS device target");
+		Require(targetPlatform == 0 || targetPlatform == platform, "Conflicting target platforms");
+		targetPlatform = platform;
+	};
 	uint64_t pos = 32;
 	for (uint32_t i = 0; i < count; ++i) {
 		Require(pos <= commandsEnd && commandsEnd - pos >= 8, "Truncated load command");
@@ -157,8 +171,11 @@ LibAppInfo MachOHelper::MapLibApp(const char* path)
 			file.Range(stringsOffset, stringsSize);
 		} else if (cmd == 0x32) { // LC_BUILD_VERSION
 			Require(size >= 24, "Truncated build version command");
-			const auto platform = file.U32(pos + 8);
-			Require(platform == 1 || platform == 2, "Expected macOS or iOS device target");
+			Require(24 + uint64_t(file.U32(pos + 20)) * 8 == size, "Invalid build tool table");
+			setPlatform(file.U32(pos + 8));
+		} else if (cmd == 0x24 || cmd == 0x25) { // LC_VERSION_MIN_MACOSX / IPHONEOS
+			Require(size == 16, "Invalid minimum OS version command");
+			setPlatform(cmd == 0x24 ? 1 : 2);
 		} else if (cmd == 0x21 || cmd == 0x2c) { // LC_ENCRYPTION_INFO[_64]
 			Require(size >= (cmd == 0x2c ? 24u : 20u), "Truncated encryption command");
 			Require(file.U32(pos + 16) == 0, "Encrypted snapshot image is unsupported");
@@ -213,7 +230,16 @@ LibAppInfo MachOHelper::MapLibApp(const char* path)
 			const auto length = file.U64(offset + 4);
 			Require(length >= 49 && length <= remaining - 4, "Data snapshot exceeds its file-backed segment");
 			auto flags = file.Range(offset + 52, length + 4 - 52);
-			Require(std::memchr(flags.data(), 0, flags.size()) != nullptr, "Unterminated snapshot flags");
+			const auto* end = static_cast<const uint8_t*>(std::memchr(flags.data(), 0, flags.size()));
+			Require(end != nullptr, "Unterminated snapshot flags");
+			if (targetPlatform != 0) {
+				// SDK feature strings are space-separated tokens. Match complete
+				// tokens, not substrings of feature names such as no-foo.
+				const std::string features = " " + std::string(reinterpret_cast<const char*>(flags.data()), end - flags.data()) + " ";
+				const bool ios = features.find(" ios ") != std::string::npos;
+				const bool macos = features.find(" macos ") != std::string::npos;
+				Require(ios != macos && ios == (targetPlatform == 2), "Snapshot platform does not match image");
+			}
 		} else {
 			const auto length = file.U64(offset);
 			Require(length >= 16 && length <= remaining, "Instruction image exceeds its file-backed segment");

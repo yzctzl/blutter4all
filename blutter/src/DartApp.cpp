@@ -9,10 +9,29 @@ PRAGMA_WARNING(push, 0)
 PRAGMA_WARNING(pop)
 #include <format>
 #include <iostream> // for debugging purpose
+#include <array>
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+
+static LibAppInfo map_libapp(const char* path)
+{
+	std::ifstream file(path, std::ios::binary);
+	if (!file)
+		throw std::invalid_argument("Cannot open snapshot image");
+	std::array<char, 4> magic{};
+	if (!file.read(magic.data(), magic.size()))
+		throw std::invalid_argument("Truncated snapshot image");
+	if (std::memcmp(magic.data(), "\x7f" "ELF", 4) == 0)
+		return ElfHelper::MapLibAppSo(path);
+	if (MachOHelper::IsMachO(path))
+		return MachOHelper::MapLibApp(path);
+	throw std::invalid_argument("Unsupported snapshot format; expected ELF or Mach-O");
+}
 
 DartApp::DartApp(const char* path) : ppool(NULL), nativeLib(0xdeadead), throwStubAddr(0)
 {
-	auto libInfo = MachOHelper::IsMachO(path) ? MachOHelper::MapLibApp(path) : ElfHelper::MapLibAppSo(path);
+	auto libInfo = map_libapp(path);
 	image_owner = std::move(libInfo.owner);
 	lib_base = libInfo.lib;
 	vm_snapshot_data = libInfo.vm_snapshot_data;

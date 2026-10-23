@@ -246,6 +246,12 @@ class FunctionAnalyzer
 	std::array<DartClass*, Reg::kNumberOfRegisters> objects{};
 	std::array<bool, Reg::kNumberOfRegisters> nonObjects{};
 	std::array<std::optional<int64_t>, Reg::kNumberOfRegisters> fieldTables{};
+	struct FieldAddress {
+		Reg object;
+		int64_t offset;
+	};
+	std::array<std::optional<FieldAddress>, dart::kNumberOfCpuRegisters> fieldAddresses{};
+	void trackFieldAddress(const InsnCursor& insn);
 	struct SavedFpu {
 		uint64_t end;
 		std::vector<CpuRegister> regs;
@@ -766,6 +772,13 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(InsnCursor& insn)
 		scale = insn.op(1).shift.value;
 	}
 	Reg base{object == ARM_REG_INVALID ? memory->base : object};
+	// StoreObjectIntoObjectNoBarrier can load a pool constant between the
+	// slot ADD and STR. Resolve only a live, same-block constant address.
+	if (base.IsSet() && !base.IsDecimal() && fieldAddresses[base]) {
+		const auto& slot = *fieldAddresses[base];
+		adjustment += slot.offset;
+		base = slot.object;
+	}
 	if (!base.IsSet() || base.IsDecimal() || base == Reg{dart::PP} || base == Reg{dart::THR})
 		return nullptr;
 	if (base == Reg{dart::SPREG} || base == Reg{dart::FPREG} || base == Reg{dart::PC})
@@ -2679,6 +2692,48 @@ const FunctionAnalyzer::Matcher FunctionAnalyzer::matchers[] = {
 	&FunctionAnalyzer::processLoadStore,
 };
 
+// Remember an address expression, not an object identity for the pointer.
+// The original object register must remain live: rewriting it or the address,
+// crossing a call/branch, or entering a join invalidates the expression.
+void FunctionAnalyzer::trackFieldAddress(const InsnCursor& insn)
+{
+	Reg destination;
+	std::optional<FieldAddress> address;
+	if (insn.Is(ARM_INS_ADD, 3) && !insn.detail().update_flags && insn.op(0).type == ARM_OP_REG &&
+		insn.op(1).type == ARM_OP_REG && insn.op(2).type == ARM_OP_IMM) {
+		destination = Reg{static_cast<arm_reg>(insn.op(0).reg)};
+		const Reg source{static_cast<arm_reg>(insn.op(1).reg)};
+		if (source.IsSet() && !source.IsDecimal()) {
+			if (fieldAddresses[source])
+				address = fieldAddresses[source];
+			else if (!nonObjects[source] && source != Reg{dart::PP} && source != Reg{dart::THR} &&
+					 source != Reg{dart::SPREG} && source != Reg{dart::FPREG} && source != Reg{dart::PC})
+				address = FieldAddress{source, 0};
+			if (address)
+				address->offset += insn.op(2).imm;
+		}
+	}
+	for (unsigned i = 0; i < insn.detail().op_count; ++i) {
+		const auto& op = insn.op(i);
+		Reg written;
+		if (op.type == ARM_OP_REG && (op.access & CS_AC_WRITE))
+			written = Reg{static_cast<arm_reg>(op.reg)};
+		else if (op.type == ARM_OP_MEM && insn.detail().writeback)
+			written = Reg{op.mem.base};
+		if (!written.IsSet() || written.IsDecimal())
+			continue;
+		fieldAddresses[written].reset();
+		for (auto& slot : fieldAddresses) {
+			if (slot && slot->object == written)
+				slot.reset();
+		}
+		if (address && address->object == written)
+			address.reset();
+	}
+	if (address && destination.IsSet() && address->offset >= 0 && address->offset <= UINT32_MAX)
+		fieldAddresses[destination] = address;
+}
+
 void FunctionAnalyzer::emit(std::unique_ptr<ILInstr> il, size_t start, size_t end)
 {
 	DartClass* movedObject = nullptr;
@@ -2694,6 +2749,7 @@ void FunctionAnalyzer::emit(std::unique_ptr<ILInstr> il, size_t start, size_t en
 		Reg tableDestination;
 		std::optional<int64_t> tableValue;
 		InsnCursor cursor{instructions, targets, i};
+		trackFieldAddress(cursor);
 		const auto memory = readMemory(cursor);
 		if (memory && memory->load && memory->size == dart::kWordSize && memory->base == CSREG_DART_THR &&
 			memory->offset == AOT_Thread_field_table_values_offset) {
@@ -2747,6 +2803,7 @@ void FunctionAnalyzer::emit(std::unique_ptr<ILInstr> il, size_t start, size_t en
 			});
 		if (transfer || il->Kind() == ILInstr::Return) {
 			objects.fill(nullptr);
+			fieldAddresses.fill(std::nullopt);
 			fieldTables.fill(std::nullopt);
 			nonObjects.fill(false);
 		}
@@ -2792,6 +2849,13 @@ void FunctionAnalyzer::emit(std::unique_ptr<ILInstr> il, size_t start, size_t en
 		auto* fn = static_cast<CallInstr&>(*il).GetFunction();
 		if (fn && fn->ReturnType() != dart::kIllegalCid)
 			objects[Reg{dart::CallingConventions::kReturnReg}] = app.FindClass(fn->ReturnType());
+		// AllocateArray has no Dart function signature. Its exact VM entry and
+		// AllocateArrayABI result establish a List, including barrier-free fills.
+		if (fn && fn->IsStub() && fn->AsStub()->kind == DartStub::AllocateArrayStub) {
+			const auto& code = dart::Code::Handle(fn->AsStub()->ptr);
+			if (!code.IsNull() && fn->Address() == code.EntryPoint() - uintptr_t(app.base()))
+				objects[Reg{dart::AllocateArrayABI::kResultReg}] = app.FindClass(dart::kArrayCid);
+		}
 	} else if (il->Kind() == ILInstr::BoxInt64) {
 		const auto reg = static_cast<BoxInt64Instr&>(*il).objReg;
 		objects[reg] = nullptr;
@@ -2820,6 +2884,7 @@ void FunctionAnalyzer::asm2il()
 	for (size_t i = 0; i < instructions.Count();) {
 		if (targets.contains(instructions.Ptr(i)->address)) {
 			objects.fill(nullptr);
+			fieldAddresses.fill(std::nullopt);
 			fieldTables.fill(std::nullopt);
 			nonObjects.fill(false);
 		}

@@ -127,3 +127,24 @@ ARM64 pattern coverage is broader. The Frida template currently requires ARM64
 with compressed pointers. Real Windows/Linux ELF and macOS universal Mach-O
 samples have been exercised on a Linux x64 host; native Windows/macOS host
 builds have not been validated for this change.
+
+### Android ARMv7 snapshots
+
+ARM32 ELF AOT snapshots (`armeabi-v7a`) can be loaded and analyzed offline:
+
+```sh
+python blutter.py path/to/app.apk output --arch arm
+```
+
+The ARM backend uses the SDK's ARM ABI and A32 instructions. It recognizes
+frames, stack checks, object pools, constants, direct and indirect calls,
+register moves, and returns. Unrecognized instructions retain their original
+assembly.
+
+ARM snapshots require a **32-bit Blutter and Dart runtime**, without pointer
+compression. On Linux x86 hosts CMake selects `-m32`; a multilib C++ toolchain
+and matching 32-bit ICU and Capstone libraries must be available. A custom
+32-bit toolchain can also be supplied with CMake. This path has been exercised
+on Linux x64 with Dart 2.19.6 and 3.10.8 ARMv7 samples; other host platforms
+have not been runtime-validated. Modern macOS cannot run this
+32-bit executable. ARM32 Mach-O and Thumb code are not supported.

@@ -48,6 +48,8 @@ def extract_libflutter_info(libflutter_file, target_arch=None):
         elf = ELFFile(f)
         if elf.header.e_machine == 'EM_AARCH64': # 183
             arch = 'arm64'
+        elif elf.header.e_machine == 'EM_ARM':
+            arch = 'arm'
         elif elf.header.e_machine == 'EM_X86_64': # 62
             arch = 'x64'
         else:
@@ -131,7 +133,7 @@ def extract_dart_info(libapp_file: str, libflutter_file: str, target_arch=None):
     #print(flags)
 
     if not apple:
-        architectures = [value for value in ('arm64', 'x64') if value in flags]
+        architectures = [value for value in ('arm64', 'x64', 'arm') if value in flags]
         platforms = [value for value in ('android', 'linux', 'windows') if value in flags]
         if len(architectures) != 1 or len(platforms) != 1:
             raise ValueError('Missing or ambiguous snapshot architecture/platform')
@@ -140,7 +142,7 @@ def extract_dart_info(libapp_file: str, libflutter_file: str, target_arch=None):
             raise ValueError('Requested architecture does not match snapshot')
         with open(libapp_file, 'rb') as stream:
             machine = ELFFile(stream).header.e_machine
-        if machine != {'arm64': 'EM_AARCH64', 'x64': 'EM_X86_64'}[arch]:
+        if machine != {'arm64': 'EM_AARCH64', 'x64': 'EM_X86_64', 'arm': 'EM_ARM'}[arch]:
             raise ValueError('Snapshot architecture does not match ELF header')
         if os_name == 'windows':
             # The engine is PE even when its AOT payload is ELF. Read only

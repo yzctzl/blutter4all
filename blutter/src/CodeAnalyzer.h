@@ -19,8 +19,8 @@ struct AsmText {
 	};
 
 	uint64_t addr;
-	// First 16 bytes hold the mnemonic; x64 operands can be longer.
-#if defined(TARGET_ARCH_X64)
+	// First 16 bytes hold the mnemonic; x64 operands and ARM register lists can be longer.
+#if defined(TARGET_ARCH_X64) || defined(TARGET_ARCH_ARM)
 	char text[176]; // Capstone op_str is at most 160 bytes including NUL.
 #else
 	char text[71];
@@ -183,7 +183,7 @@ public:
 	bool useFramePointer{ false };
 	uint64_t firstCheckStackOverflowAddr{ 0 };
 	FnParams params;
-	// Observed x64 entry locations; no declaration order, arity or optionality inferred.
+	// Observed entry locations; no declaration order, arity or optionality inferred.
 	std::vector<FnParamInfo> incomingParameters;
 	std::vector<std::unique_ptr<ILInstr>> il_insns;
 	DartType* returnType{ nullptr };

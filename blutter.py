@@ -99,13 +99,17 @@ def extract_libs_from_apple_archive(archive: str, out_dir: str):
             paths.append(target)
         return tuple(paths)
 
-def extract_libs_from_apk(apk_file: str, out_dir: str):
+def extract_libs_from_apk(apk_file: str, out_dir: str, target_arch=None):
     with zipfile.ZipFile(apk_file, "r") as zf:
-        try:
-            app_info = zf.getinfo('lib/arm64-v8a/libapp.so')
-            flutter_info = zf.getinfo('lib/arm64-v8a/libflutter.so')
-        except:
-            sys.exit("Cannot find libapp.so or libflutter.so in the APK")
+        abis = {'arm64': 'arm64-v8a', 'x64': 'x86_64', 'arm': 'armeabi-v7a'}
+        candidates = [abis[target_arch]] if target_arch else list(abis.values())
+        names = set(zf.namelist())
+        abi = next((abi for abi in candidates if all(f'lib/{abi}/{name}' in names
+                    for name in ('libapp.so', 'libflutter.so'))), None)
+        if abi is None:
+            raise ValueError('Cannot find a matching app/engine ABI pair in the APK')
+        app_info = zf.getinfo(f'lib/{abi}/libapp.so')
+        flutter_info = zf.getinfo(f'lib/{abi}/libflutter.so')
 
         zf.extract(app_info, out_dir)
         zf.extract(flutter_info, out_dir)
@@ -231,7 +235,7 @@ def build_and_run(input: BlutterInput):
         else:
             assert False, "Unknown Visual Studio version"
 
-        subprocess.run([CMAKE_CMD, '-G', generator, '-A', 'x64', '-B', input.outdir, f'-DDARTLIB={input.dart_info.lib_name}', 
+        subprocess.run([CMAKE_CMD, '-G', generator, '-A', 'Win32' if input.dart_info.arch == 'arm' else 'x64', '-B', input.outdir, f'-DDARTLIB={input.dart_info.lib_name}',
                         f'-DNAME_SUFFIX={input.name_suffix}', f'-DDBG_CMD:STRING={dbg_cmd_args}'] + macros + [blutter_dir], check=True)
         dbg_exe_dir = os.path.join(input.outdir, 'Debug')
         os.makedirs(dbg_exe_dir, exist_ok=True)
@@ -264,7 +268,8 @@ def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no
         os.makedirs(scratch, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='blutter-input-', dir=scratch) as tmp_dir:
             extract = extract_libs_from_apk if extension == '.apk' else extract_libs_from_apple_archive
-            libapp_file, libflutter_file = extract(indir, tmp_dir)
+            libapp_file, libflutter_file = (extract(indir, tmp_dir, target_arch) if extension == '.apk'
+                                           else extract(indir, tmp_dir))
             main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, target_arch)
     else:
         libapp_file, libflutter_file = find_lib_files(indir)
@@ -277,7 +282,7 @@ if __name__ == "__main__":
         description='Reversing a flutter application tool')
     parser.add_argument('indir', help='An APK, IPA, macOS app ZIP, app bundle, or directory containing the AOT and engine binaries')
     parser.add_argument('outdir', help='An output directory')
-    parser.add_argument('--arch', choices=('arm64', 'x64'), help='Select architecture in a universal Mach-O (default: arm64)')
+    parser.add_argument('--arch', choices=('arm64', 'x64', 'arm'), help='Select APK ABI or universal Mach-O architecture (default: arm64 when available)')
     parser.add_argument('--rebuild', action='store_true', default=False, help='Force rebuild the Blutter executable')
     parser.add_argument('--vs-sln', action='store_true', default=False, help='Generate Visual Studio solution at <outdir>')
     parser.add_argument('--no-analysis', action='store_true', default=False, help='Do not build with code analysis')

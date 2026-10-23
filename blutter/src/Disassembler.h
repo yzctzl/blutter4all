@@ -19,6 +19,9 @@ using CpuRegister = A64::Register;
 #elif defined(TARGET_ARCH_X64)
 #include "Disassembler_x64.h"
 using CpuRegister = X64::Register;
+#elif defined(TARGET_ARCH_ARM)
+#include "Disassembler_arm.h"
+using CpuRegister = ARM::Register;
 #else
 #error Unsupported target architecture
 #endif

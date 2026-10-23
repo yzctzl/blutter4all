@@ -7,11 +7,15 @@ inline intptr_t PoolIndexFromOffset(intptr_t offset) {
     return dart::ObjectPool::IndexFromOffset(offset - dart::kHeapObjectTag);
 }
 
-#if defined(TARGET_ARCH_X64)
+#if defined(TARGET_ARCH_X64) || defined(TARGET_ARCH_ARM)
 constexpr intptr_t kPoolPointerTag = dart::kHeapObjectTag;
-constexpr intptr_t kUnlinkedCallTargetDelta = -1;
 #else
 constexpr intptr_t kPoolPointerTag = 0;
+#endif
+
+#if defined(TARGET_ARCH_X64) || defined(TARGET_ARCH_ARM)
+constexpr intptr_t kUnlinkedCallTargetDelta = -1;
+#else
 constexpr intptr_t kUnlinkedCallTargetDelta = 1;
 #endif
 

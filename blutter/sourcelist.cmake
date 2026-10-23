@@ -46,6 +46,8 @@ set(SRCS
 
 if (DARTLIB MATCHES "_x64($|_)")
     list(APPEND SRCS CodeAnalyzer_x64.cpp Disassembler_x64.cpp Disassembler_x64.h)
+elseif (DARTLIB MATCHES "_arm($|_)")
+    list(APPEND SRCS CodeAnalyzer_arm.cpp Disassembler_arm.cpp Disassembler_arm.h)
 else()
     list(APPEND SRCS CodeAnalyzer_arm64.cpp Disassembler_arm64.cpp Disassembler_arm64.h)
 endif()

@@ -609,6 +609,8 @@ void DartApp::finalizeFunctionsInfo()
 			const intptr_t num_opt_pos_params = sig.NumOptionalPositionalParameters();
 			const intptr_t num_opt_named_params = sig.NumOptionalNamedParameters();
 			const intptr_t num_opt_params = num_opt_pos_params + num_opt_named_params;
+			dartFn->Signature().numOptionalParam = num_opt_params;
+			dartFn->Signature().hasNamedParam = num_opt_named_params > 0;
 
 			auto& dname = dart::String::Handle();
 			for (intptr_t i = 0; i < num_params; i++) {

@@ -137,12 +137,13 @@ python blutter.py path/to/app.apk output --arch arm
 ```
 
 The ARM backend uses the SDK's ARM ABI and A32 instructions. It recognizes
-frames, stack checks, object pools, constants, direct and indirect calls,
-register moves, returns, class IDs, integer boxing/unboxing, fixed-size inline
-allocation, type-test stubs, async initialization, runtime/closure/dispatch calls,
-and paired CPU/FPU register preservation scopes. Selected field/list/typed-data accesses, write barriers, static fields, and
-late initialization are recognized too. Unrecognized instructions retain their
-original assembly.
+frames, stack checks, object pools, calls, class IDs, integer boxing/unboxing,
+fixed-size inline allocation, write barriers, async initialization, type-test
+stubs, static fields, and selected field/list/typed-data accesses. Paired stub
+scopes recover saved CPU/FPU registers. Parameter recovery uses surviving
+signatures, observed register/stack sources, and verified optional/named/default
+and type-argument protocols. Missing declarations and eliminated defaults remain
+partial; unrecognized instructions retain their original assembly.
 
 ARM snapshots require a **32-bit Blutter and Dart runtime**, without pointer
 compression. On Linux x86 hosts CMake selects `-m32`; a multilib C++ toolchain

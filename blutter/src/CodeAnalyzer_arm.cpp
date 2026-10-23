@@ -234,8 +234,11 @@ std::optional<MemoryAccess> readMemory(const InsnCursor& insn, bool indexed = fa
 	return MemoryAccess{value, static_cast<arm_reg>(insn.op(1).mem.base), insn.op(1).mem.disp, size, load};
 }
 
+class ArmParameterRecovery;
+
 class FunctionAnalyzer
 {
+	friend class ArmParameterRecovery;
 	DartApp& app;
 	AnalyzedFnData& data;
 	AsmInstructions& instructions;
@@ -273,9 +276,13 @@ class FunctionAnalyzer
 	LoadValueInstr* previousLoad(const InsnCursor& insn);
 	std::unique_ptr<ILInstr> processBoxInt64Instr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processTaggedClassIdInstr(InsnCursor& insn);
+	void recoverParameters();
+	void processPrologueParameters();
 	void processSavedRegisters();
 	std::unique_ptr<ILInstr> processSaveRegisterInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processLoadSavedRegisterInstr(InsnCursor& insn);
+	void recoverIncomingParameters();
+	void recoverRegisterParameters();
 	std::unique_ptr<ILInstr> processReturnInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processMoveRegInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processLoadValueInstr(InsnCursor& insn);
@@ -1565,6 +1572,773 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processBoxInt64Instr(InsnCursor& insn
 
 // PrologueBuilder produces descriptor arithmetic, followed by supplied/default
 // diamonds. Track only those expressions; do not interpret arbitrary body code.
+class ArmParameterRecovery
+{
+	FunctionAnalyzer& fn;
+	bool inferredDeclaration{false};
+	std::vector<int> requiredOrder;
+	enum Kind {
+		Unknown,
+		Descriptor,
+		Count,
+		FrameAddress,
+		Name,
+		Position,
+		Value,
+		Constant,
+		Symbol,
+		Dynamic,
+		Null,
+		TypeArgsLength,
+		TypeArgsValue,
+		RequiredPosition,
+		Context,
+		DoubleAddress,
+		DoubleValue
+	};
+	struct Source {
+		Kind kind{Unknown};
+		int64_t offset{0};
+		int parameter{-1};
+		int64_t scale{1};
+		bool operator==(const Source&) const = default;
+	};
+	using Registers = std::array<Source, Reg::kNumberOfRegisters>;
+	Registers registers{};
+	std::vector<AddrRange> ranges, typeArgumentRanges;
+	std::unordered_set<uint64_t> joins;
+	int checkedTuple{-1}, checkedParameter{-1}, checkedSymbol{-1}, checkedScale{1}, nextSymbol{0};
+
+	Source source(const cs_arm_op& op) const
+	{
+		if (op.type == ARM_OP_IMM)
+			return {Constant, op.imm};
+		if (op.type != ARM_OP_REG || op.shift.type != ARM_SFT_INVALID)
+			return {};
+		Reg reg{static_cast<arm_reg>(op.reg)};
+		return reg.IsSet() ? registers[reg] : Source{};
+	}
+	bool transfer(size_t& index);
+	bool defaultDiamond(size_t& index);
+	bool typeArgumentDiamond(size_t& index);
+	bool floatingConstant(size_t& index, std::unique_ptr<ILInstr>* constant = nullptr);
+	bool doubleParameter(int parameter) const;
+	bool closedRange(size_t begin, size_t end) const;
+	int comparedParameter(const cs_arm& arm, int& tuple);
+
+  public:
+	explicit ArmParameterRecovery(FunctionAnalyzer& fn) : fn(fn), inferredDeclaration(fn.data.params.empty())
+	{
+		// With only required names, every descriptor entry is present and its
+		// alphabetic slot is proven by the surviving signature. Mixed optional
+		// names require the explicit name comparison protocol instead.
+		if (!fn.data.params.isNamedParam || inferredDeclaration)
+			return;
+		for (int i = fn.data.params.numFixedParam; i < fn.data.params.NumParam(); ++i) {
+			if (i >= fn.data.dartFn.NumParam() || !fn.data.dartFn.Params()[i].isRequired ||
+				fn.data.params[i].name.empty()) {
+				requiredOrder.clear();
+				return;
+			}
+			requiredOrder.push_back(i);
+		}
+		std::sort(requiredOrder.begin(), requiredOrder.end(), [&](int left, int right) {
+			const auto& vm = dart::Function::Handle(fn.data.dartFn.Ptr());
+			const auto& a = dart::String::Handle(vm.ParameterNameAt(left));
+			const auto& b = dart::String::Handle(vm.ParameterNameAt(right));
+			return a.CompareTo(b) < 0;
+		});
+	}
+	void Recover();
+};
+
+bool ArmParameterRecovery::closedRange(size_t begin, size_t end) const
+{
+	const auto first = fn.instructions.Ptr(begin)->address;
+	const auto last = fn.instructions.Ptr(end)->address;
+	for (size_t i = 0; i < fn.instructions.Count(); ++i) {
+		const auto& instruction = *fn.instructions.Ptr(i);
+		if (instruction.id != ARM_INS_B && instruction.id != ARM_INS_BL)
+			continue;
+		const auto& arm = instruction.detail->arm;
+		if (arm.op_count != 1 || arm.operands[0].type != ARM_OP_IMM)
+			continue;
+		const auto target = uint32_t(arm.operands[0].imm);
+		if (target > first && target < last && (i < begin || i >= end))
+			return false;
+	}
+	return true;
+}
+
+bool ArmParameterRecovery::doubleParameter(int parameter) const
+{
+	if (fn.data.dartFn.Ptr() == dart::Function::null())
+		return false;
+	const auto& vm = dart::Function::Handle(fn.data.dartFn.Ptr());
+	const auto& signature = dart::FunctionType::Handle(vm.signature());
+	if (signature.IsNull() || parameter < 0 || parameter >= signature.NumParameters())
+		return false;
+	return dart::AbstractType::Handle(signature.ParameterTypeAt(parameter)).IsDoubleType();
+}
+
+bool ArmParameterRecovery::transfer(size_t& index)
+{
+	InsnCursor cursor{fn.instructions, fn.targets, index};
+	const auto& arm = cursor.detail();
+	if (!isUnconditional(*cursor.Current()) || arm.update_flags)
+		return false;
+	auto poolCursor = cursor;
+	auto constant = fn.processObjectPoolInstr(poolCursor);
+	if (constant)
+		index = poolCursor.End() - 1;
+	if (!constant) {
+		constant = fn.processLoadValueInstr(cursor);
+	}
+	if (constant) {
+		auto& load = static_cast<LoadValueInstr&>(*constant);
+		Source result;
+		if (load.val.Value()->RawTypeId() == dart::kNullCid)
+			result = {Null};
+		else if (load.val.Value()->RawTypeId() == dart::kIntegerCid)
+			result = {Constant, int(load.val.Value()->AsInteger()->val)};
+		else if (load.val.Value()->RawTypeId() == dart::kStringCid &&
+				 load.val.storage.kind == VarStorage::Pool)
+			result = {Symbol, int(load.val.storage.offset)};
+		registers[load.dstReg] = result;
+		index = std::max(index, cursor.End() - 1);
+		return true;
+	}
+	Source result;
+	if (cursor.Is(ARM_INS_MOV, 2)) {
+		result = source(arm.operands[1]);
+	} else if ((cursor.Is(ARM_INS_ADD, 3) || cursor.Is(ARM_INS_SUB, 3)) && !arm.update_flags) {
+		const auto left = source(arm.operands[1]);
+		const auto right = source(arm.operands[2]);
+		const int sign = cursor.Current()->id == ARM_INS_ADD ? 1 : -1;
+		if (left.kind == Count && right.kind == Constant) {
+			result = {Count, left.offset + sign * right.offset, left.parameter};
+			if (inferredDeclaration && left.parameter == -1 && left.offset == 0 && sign == -1 &&
+				right.offset >= 0 && right.offset % 2 == 0 && right.offset / 2 < UINT8_MAX &&
+				fn.data.params.empty()) {
+				fn.data.params.numFixedParam = right.offset / 2;
+				for (int i = 0; i < fn.data.params.numFixedParam; ++i)
+					fn.data.params.add(FnParamInfo{});
+			}
+		} else if (left.kind == Count && left.parameter == -1 && left.offset == 0 &&
+				   right.kind == RequiredPosition && sign == -1)
+			result = {Count, left.offset, right.parameter};
+		else if (left.kind == Count && left.parameter == -1 && left.offset == 0 && right.kind == Position &&
+				 sign == -1 && right.offset == checkedTuple && right.parameter == checkedSymbol &&
+				 right.scale == checkedScale)
+			result = {Count, left.offset, checkedParameter};
+		else if (left.kind == Value && right.kind == Constant && sign == 1 && doubleParameter(left.parameter))
+			result = {DoubleAddress, right.offset, left.parameter};
+		else if (left.kind == Dynamic && right.kind == Constant)
+			result = {Dynamic, left.offset + sign * right.offset, left.parameter, left.scale};
+		else if (left.kind == Constant && right.kind == Constant)
+			result = {Constant, left.offset + sign * right.offset};
+		else if (sign == 1 && arm.operands[2].type == ARM_OP_REG) {
+			const auto& shifted = arm.operands[2];
+			const Reg reg{static_cast<arm_reg>(shifted.reg)};
+			if (!reg.IsSet() || shifted.shift.type != ARM_SFT_LSL || shifted.shift.value != 1)
+				return false;
+			const auto offset = registers[reg];
+			if (isReg(arm.operands[1], CSREG_DART_FP) && offset.kind == Count)
+				result = {FrameAddress, offset.offset * 2, offset.parameter};
+			else if (left.kind == Descriptor && (offset.kind == Constant || offset.kind == Dynamic))
+				result = {Descriptor, left.offset + offset.offset * 2, offset.parameter, offset.scale * 2};
+		}
+	} else if (cursor.Is(ARM_INS_LSL, 2) && !arm.update_flags) {
+		const auto& shifted = arm.operands[1];
+		const Reg reg{static_cast<arm_reg>(shifted.reg)};
+		if (shifted.type == ARM_OP_REG && reg.IsSet() && shifted.shift.value < 5) {
+			const auto value = registers[reg];
+			if ((value.kind == Constant || value.kind == Dynamic) && value.scale <= 64 &&
+				value.offset >= INT32_MIN && value.offset <= INT32_MAX)
+				result = {value.kind,
+					value.offset * (1 << shifted.shift.value),
+					value.parameter,
+					value.scale * (1 << shifted.shift.value)};
+		}
+	} else if (const auto memory = readMemory(cursor)) {
+		Reg base{memory->base};
+		if (!base.IsSet())
+			return false;
+		const auto address = registers[base];
+		if (memory->load && memory->size == 8 && memory->value.IsDecimal() && address.kind == DoubleAddress) {
+			if (address.offset + memory->offset != AOT_Double_value_offset - dart::kHeapObjectTag)
+				return false;
+			registers[memory->value] = {DoubleValue, 0, address.parameter};
+			return true;
+		}
+		if (memory->size != dart::kWordSize &&
+			!(memory->size == 8 && !memory->load && registers[memory->value].kind == DoubleValue))
+			return false;
+		if (!memory->load) {
+			if (memory->base != CSREG_DART_FP || memory->offset >= 0)
+				return false;
+			// A spill of another entry value does not alter descriptor facts.
+			return true;
+		}
+		if (address.kind == Descriptor) {
+			const auto offset = address.offset + memory->offset + dart::kHeapObjectTag;
+			if (offset == dart::ArgumentsDescriptor::count_offset())
+				result = {Count};
+			else if (offset == dart::ArgumentsDescriptor::type_args_len_offset())
+				result = {TypeArgsLength};
+			else if (offset == dart::ArgumentsDescriptor::size_offset())
+				result = {Count, 0, -2};
+			else if (offset >= dart::ArgumentsDescriptor::first_named_entry_offset() &&
+					 offset < dart::ArgumentsDescriptor::first_named_entry_offset() +
+								  UINT8_MAX * dart::ArgumentsDescriptor::named_entry_size()) {
+				const auto tuple = offset - dart::ArgumentsDescriptor::first_named_entry_offset();
+				if (tuple % dart::ArgumentsDescriptor::named_entry_size() ==
+					dart::ArgumentsDescriptor::name_offset())
+					result = {Name, tuple, address.parameter, address.scale};
+				else if (tuple % dart::ArgumentsDescriptor::named_entry_size() ==
+						 dart::ArgumentsDescriptor::position_offset())
+					result = {Position,
+						tuple - dart::ArgumentsDescriptor::position_offset(),
+						address.parameter,
+						address.scale};
+				if (result.kind == Position && address.parameter == -1) {
+					const auto entry = result.offset / dart::ArgumentsDescriptor::named_entry_size();
+					if (entry >= 0 && entry < int(requiredOrder.size()))
+						result = {RequiredPosition, result.offset, requiredOrder[entry]};
+				}
+			}
+		} else if (address.kind == FrameAddress) {
+			const auto offset = address.offset + memory->offset;
+			int parameter = address.parameter;
+			if (parameter >= 0 && offset != dart::kWordSize)
+				return false;
+			if (parameter == -2 && offset == 2 * dart::kWordSize)
+				result = {TypeArgsValue};
+			if (parameter == -1 && offset % dart::kWordSize == 0)
+				parameter = 1 - offset / dart::kWordSize;
+			if (parameter >= 0 && parameter < fn.data.params.NumParam())
+				result = {Value, 0, parameter};
+		} else if (address.kind == Value && address.parameter == 0 && fn.data.dartFn.IsClosure() &&
+				   memory->offset == AOT_Closure_context_offset - dart::kHeapObjectTag) {
+			result = {Context};
+		} else if (memory->base == CSREG_DART_FP) {
+			for (int i = 0; i < fn.data.params.NumParam(); ++i)
+				if (fn.data.params[i].paramOffset == memory->offset &&
+					fn.data.params[i].valReg == memory->value)
+					result = {Value, 0, i};
+		} else {
+			return false;
+		}
+		registers[memory->value] = result;
+		return true;
+	} else {
+		return false;
+	}
+	if (arm.op_count == 0 || arm.operands[0].type != ARM_OP_REG)
+		return false;
+	Reg destination{static_cast<arm_reg>(arm.operands[0].reg)};
+	if (!destination.IsSet() || destination.IsDecimal())
+		return false;
+	registers[destination] = result;
+	return true;
+}
+
+int ArmParameterRecovery::comparedParameter(const cs_arm& arm, int& tuple)
+{
+	const auto left = source(arm.operands[0]), right = source(arm.operands[1]);
+	if (left.kind == Count && left.parameter == -1 && right.kind == Constant &&
+		!fn.data.params.isNamedParam) {
+		if (right.offset <= 0 || right.offset % 2 || left.offset % 2)
+			return -1;
+		const auto parameter = (right.offset - left.offset) / 2 - 1;
+		if (parameter < 0 || parameter >= UINT8_MAX)
+			return -1;
+		if (inferredDeclaration && parameter >= fn.data.params.numFixedParam && parameter < UINT8_MAX)
+			while (fn.data.params.NumParam() <= parameter)
+				fn.data.params.add(FnParamInfo{});
+		return parameter;
+	}
+	const auto name = left.kind == Name ? left : right;
+	const auto symbol = left.kind == Symbol ? left : right;
+	if (name.kind != Name || symbol.kind != Symbol)
+		return -1;
+	const auto& pool = fn.app.GetObjectPool();
+	const auto& object = dart::Object::Handle(pool.ObjectAt(PoolIndexFromOffset(symbol.offset)));
+	if (!object.IsString())
+		return -1;
+	tuple = name.offset;
+	checkedSymbol = name.parameter;
+	checkedScale = name.scale;
+	const std::string text = dart::String::Cast(object).ToCString();
+	for (int i = fn.data.params.numFixedParam; i < fn.data.params.NumParam(); ++i)
+		if (fn.data.params[i].name == text)
+			return i;
+	if (inferredDeclaration && fn.data.params.NumParam() < UINT8_MAX) {
+		fn.data.params.isNamedParam = true;
+		fn.data.params.add(FnParamInfo{text});
+		return fn.data.params.NumParam() - 1;
+	}
+	return -1;
+}
+
+bool ArmParameterRecovery::defaultDiamond(size_t& index)
+{
+	const auto& compare = *fn.instructions.Ptr(index);
+	if (compare.id != ARM_INS_CMP || compare.detail->arm.op_count != 2 || !isUnconditional(compare))
+		return false;
+	struct DeclarationCandidate {
+		FnParams& params;
+		size_t count;
+		bool named, accepted{false};
+		~DeclarationCandidate()
+		{
+			if (!accepted) {
+				params.params.resize(count);
+				params.isNamedParam = named;
+			}
+		}
+	} declaration{fn.data.params, fn.data.params.params.size(), fn.data.params.isNamedParam};
+	checkedTuple = -1;
+	checkedSymbol = -1;
+	checkedScale = 1;
+	checkedParameter = comparedParameter(compare.detail->arm, checkedTuple);
+	if (checkedParameter < fn.data.params.numFixedParam || checkedParameter >= fn.data.params.NumParam())
+		return false;
+	if (index + 2 >= fn.instructions.Count())
+		return false;
+	const auto& branch = *fn.instructions.Ptr(index + 1);
+	const auto& arm = branch.detail->arm;
+	const auto condition = fn.data.params.isNamedParam ? ARM_CC_NE : ARM_CC_LT;
+	if (branch.id != ARM_INS_B || arm.cc != condition || arm.op_count != 1 ||
+		arm.operands[0].type != ARM_OP_IMM)
+		return false;
+	const auto missingAddress = uint32_t(arm.operands[0].imm);
+	const auto origin = fn.instructions.FirstPtr()->address;
+	if (missingAddress < branch.address + 8 || missingAddress >= fn.instructions.LastPtr()->address)
+		return false;
+	const size_t missing = (missingAddress - origin) / 4;
+	if (fn.instructions.Ptr(missing)->address != missingAddress)
+		return false;
+	const auto& jump = *fn.instructions.Ptr(missing - 1);
+	const bool triangle = jump.id != ARM_INS_B || !isUnconditional(jump);
+	if (triangle && !fn.data.params.isNamedParam)
+		return false;
+	if (!triangle && (jump.detail->arm.op_count != 1 || jump.detail->arm.operands[0].type != ARM_OP_IMM))
+		return false;
+	const auto joinAddress = triangle ? missingAddress : uint32_t(jump.detail->arm.operands[0].imm);
+	if (joinAddress < missingAddress || (!triangle && joinAddress == missingAddress) ||
+		joinAddress > fn.instructions.LastPtr()->address)
+		return false;
+	const size_t join = (joinAddress - origin) / 4;
+	if (fn.instructions.Ptr(join)->address != joinAddress || !closedRange(index, join))
+		return false;
+
+	const auto before = registers;
+	for (size_t i = index + 2; i < missing - (triangle ? 0 : 1); ++i) {
+		if (!transfer(i)) {
+			registers = before;
+			return false;
+		}
+	}
+	const auto supplied = registers;
+	registers = before;
+	std::unique_ptr<VarValue> value;
+	Reg destination;
+	// Defaults are constants, with optional parallel moves/processed-count
+	// updates. Prove the very same result register on the supplied path.
+	for (size_t i = missing; i < join; ++i) {
+		const auto& writes = fn.instructions.Ptr(i)->detail->arm;
+		for (unsigned j = 0; j < writes.op_count; ++j) {
+			const auto& op = writes.operands[j];
+			if (op.type == ARM_OP_REG && (op.access & CS_AC_WRITE) &&
+				Reg{static_cast<arm_reg>(op.reg)} == destination) {
+				value.reset();
+				destination.Clear();
+			}
+		}
+		std::unique_ptr<ILInstr> floating;
+		if (floatingConstant(i, &floating)) {
+			auto& constant = static_cast<LoadValueInstr&>(*floating);
+			if (supplied[constant.dstReg] == Source{DoubleValue, 0, checkedParameter}) {
+				destination = constant.dstReg;
+				value = constant.val.TakeValue();
+			}
+			continue;
+		}
+		InsnCursor cursor{fn.instructions, fn.targets, i};
+		auto load = fn.processObjectPoolInstr(cursor);
+		if (!load) {
+			InsnCursor immediate{fn.instructions, fn.targets, i};
+			load = fn.processLoadValueInstr(immediate);
+		}
+		if (load) {
+			auto& constant = static_cast<LoadValueInstr&>(*load);
+			if (supplied[constant.dstReg] == Source{Value, 0, checkedParameter} ||
+				supplied[constant.dstReg] == Source{DoubleValue, 0, checkedParameter}) {
+				destination = constant.dstReg;
+				value = constant.val.TakeValue();
+			}
+		}
+		if (!transfer(i)) {
+			registers = before;
+			return false;
+		}
+	}
+	// DCE can remove an unused named value and its default while retaining
+	// the name-presence/index update needed for later names. Prove only that
+	// protocol, never invent a default from a 0/2 presence flag.
+	const bool unused = !value && fn.data.params.isNamedParam &&
+						std::none_of(supplied.begin(), supplied.end(), [&](const Source& source) {
+							return (source.kind == Value || source.kind == DoubleValue) &&
+								   source.parameter == checkedParameter;
+						});
+	if (unused) {
+		for (size_t i = index + 2; i < join; ++i) {
+			const auto id = fn.instructions.Ptr(i)->id;
+			if (id != ARM_INS_MOV && id != ARM_INS_MOVW && id != ARM_INS_MOVT && id != ARM_INS_ADD &&
+				id != ARM_INS_SUB && id != ARM_INS_LSL && id != ARM_INS_B) {
+				registers = before;
+				return false;
+			}
+		}
+	}
+	if ((!value || !destination.IsSet()) && !unused) {
+		registers = before;
+		return false;
+	}
+	// Optional parameters are loaded as tagged values by PrologueBuilder.
+	// ARM immediate moves carry raw Smi bits, unlike PP's typed constants.
+	if (value && value->RawTypeId() == dart::kIntegerCid) {
+		auto* integer = static_cast<VarInteger*>(value.get());
+		if (integer->intTypeId == VarValue::NativeInt) {
+			if ((integer->val & dart::kSmiTagMask) != dart::kSmiTag) {
+				registers = before;
+				return false;
+			}
+			integer->intTypeId = dart::kSmiCid;
+		}
+	}
+	for (size_t r = 0; r < registers.size(); ++r) {
+		if (registers[r] == supplied[r])
+			continue;
+		// A varying processed-name index is still a symbolic affine value.
+		// Preserve identity through scaling; name/position must use the same
+		// expression. This does not guess how many names were supplied.
+		if ((registers[r].kind == Constant || registers[r].kind == Dynamic) &&
+			(supplied[r].kind == Constant || supplied[r].kind == Dynamic))
+			registers[r] = {Dynamic, 0, ++nextSymbol};
+		else
+			registers[r] = {};
+	}
+	if (!unused) {
+		registers[destination] = {destination.IsDecimal() ? DoubleValue : Value, 0, checkedParameter};
+		auto& parameter = fn.data.params[checkedParameter];
+		parameter.valReg = destination;
+		parameter.val = std::move(value);
+	}
+	declaration.accepted = true;
+	ranges.push_back({compare.address, joinAddress});
+	joins.insert(joinAddress);
+	index = join - 1;
+	return true;
+}
+
+bool ArmParameterRecovery::typeArgumentDiamond(size_t& index)
+{
+	const auto& compare = *fn.instructions.Ptr(index);
+	const auto& cmp = compare.detail->arm;
+	if (compare.id != ARM_INS_CMP || cmp.op_count != 2 || !isUnconditional(compare))
+		return false;
+	if (source(cmp.operands[0]).kind != TypeArgsLength || !isImm(cmp.operands[1], 0))
+		return false;
+	if (index + 2 >= fn.instructions.Count())
+		return false;
+	const auto& branch = *fn.instructions.Ptr(index + 1);
+	const auto& arm = branch.detail->arm;
+	if (branch.id != ARM_INS_B || arm.cc != ARM_CC_NE || arm.op_count != 1 ||
+		arm.operands[0].type != ARM_OP_IMM)
+		return false;
+	const auto suppliedAddress = uint32_t(arm.operands[0].imm);
+	if (suppliedAddress < branch.address + 8 || suppliedAddress >= fn.instructions.LastPtr()->address)
+		return false;
+	const size_t supplied = (suppliedAddress - fn.instructions.FirstPtr()->address) / 4;
+	if (fn.instructions.Ptr(supplied)->address != suppliedAddress)
+		return false;
+	const auto& jump = *fn.instructions.Ptr(supplied - 1);
+	const auto& edge = jump.detail->arm;
+	if (jump.id != ARM_INS_B || !isUnconditional(jump) || edge.op_count != 1 ||
+		edge.operands[0].type != ARM_OP_IMM)
+		return false;
+	const auto joinAddress = uint32_t(edge.operands[0].imm);
+	if (joinAddress <= suppliedAddress || joinAddress > fn.instructions.LastPtr()->address)
+		return false;
+	const size_t join = (joinAddress - fn.instructions.FirstPtr()->address) / 4;
+	if (fn.instructions.Ptr(join)->address != joinAddress || !closedRange(index, join))
+		return false;
+	const auto before = registers;
+	for (size_t i = index + 2; i < supplied - 1; ++i)
+		if (!transfer(i)) {
+			registers = before;
+			return false;
+		}
+	const auto absent = registers;
+	registers = before;
+	for (size_t i = supplied; i < join; ++i)
+		if (!transfer(i)) {
+			registers = before;
+			return false;
+		}
+	Reg result;
+	for (size_t r = 0; r < registers.size(); ++r) {
+		if (registers[r].kind == TypeArgsValue && absent[r].kind == Null)
+			result = Reg{static_cast<Reg::Value>(r)};
+		if (registers[r] != absent[r])
+			registers[r] = {};
+	}
+	if (!result.IsSet()) {
+		registers = before;
+		return false;
+	}
+	registers[result] = {TypeArgsValue};
+	fn.data.typeArgumentReg = result;
+	typeArgumentRanges.push_back({compare.address, joinAddress});
+	joins.insert(joinAddress);
+	index = join - 1;
+	return true;
+}
+
+bool ArmParameterRecovery::floatingConstant(size_t& index, std::unique_ptr<ILInstr>* constant)
+{
+	InsnCursor cursor{fn.instructions, fn.targets, index};
+	const auto saved = singleStackRegister(*cursor.Current(), false);
+	if (!saved.IsSet() || saved.IsDecimal() || !cursor.Next())
+		return false;
+	auto pool = cursor;
+	auto load = fn.processObjectPoolInstr(pool);
+	if (load) {
+		while (cursor.End() < pool.End())
+			cursor.Next();
+	} else
+		load = fn.processLoadValueInstr(cursor);
+	if (!load || !static_cast<LoadValueInstr&>(*load).dstReg.IsDecimal())
+		return false;
+	if (!cursor.Next() || singleStackRegister(*cursor.Current(), true) != saved)
+		return false;
+	const auto value = registers[saved];
+	for (size_t i = index; i < cursor.End(); ++i) {
+		const auto& arm = fn.instructions.Ptr(i)->detail->arm;
+		for (unsigned j = 0; j < arm.op_count; ++j) {
+			const auto& op = arm.operands[j];
+			Reg reg{static_cast<arm_reg>(op.reg)};
+			if (op.type == ARM_OP_REG && reg.IsSet() && (op.access & CS_AC_WRITE))
+				registers[reg] = {};
+		}
+	}
+	registers[saved] = value;
+	index = cursor.End() - 1;
+	if (constant)
+		*constant = std::move(load);
+	return true;
+}
+
+void ArmParameterRecovery::Recover()
+{
+	if (!fn.data.useFramePointer)
+		return;
+	if (inferredDeclaration)
+		fn.data.params.isPartial = true;
+	if (!fn.data.params.isPartial) {
+		if (fn.data.dartFn.Ptr() == dart::Function::null())
+			return;
+		const auto& vm = dart::Function::Handle(fn.data.dartFn.Ptr());
+		const auto& signature = dart::FunctionType::Handle(vm.signature());
+		if (signature.IsNull() || !vm.IsGeneric())
+			return;
+	}
+	registers[Reg{dart::ARGS_DESC_REG}] = {Descriptor};
+	for (size_t i = 0; i < fn.instructions.Count(); ++i) {
+		const auto& instruction = *fn.instructions.Ptr(i);
+		// Frame construction is structural; the first stack check closes the
+		// copy/default prologue. Never follow a body call or an unproved edge.
+		if (fn.data.firstCheckStackOverflowAddr && instruction.address >= fn.data.firstCheckStackOverflowAddr)
+			break;
+		if (instruction.id == ARM_INS_PUSH ||
+			(instruction.id == ARM_INS_ADD && isReg(instruction.detail->arm.operands[0], CSREG_DART_FP)) ||
+			(instruction.id == ARM_INS_SUB && isReg(instruction.detail->arm.operands[0], CSREG_DART_SP)))
+			continue;
+		if (i && fn.targets.contains(instruction.address) && !joins.contains(instruction.address))
+			break;
+		if (floatingConstant(i) || typeArgumentDiamond(i) || defaultDiamond(i))
+			continue;
+		const auto begin = instruction.address;
+		if (!transfer(i))
+			break;
+		for (size_t r = 0; r < registers.size(); ++r) {
+			const auto value = registers[r];
+			if (value.kind == Context)
+				fn.data.closureContextReg = Reg{static_cast<Reg::Value>(r)};
+			if (value.kind == Value || value.kind == DoubleValue)
+				fn.data.params[value.parameter].valReg = Reg{static_cast<Reg::Value>(r)};
+		}
+		InsnCursor spillCursor{fn.instructions, fn.targets, i};
+		if (const auto memory = readMemory(spillCursor); memory && !memory->load) {
+			const auto value = registers[memory->value];
+			if (memory->base == CSREG_DART_FP && memory->offset < 0) {
+				if (value.kind == Value || value.kind == DoubleValue)
+					fn.data.params[value.parameter].localOffset = memory->offset;
+				else if (value.kind == TypeArgsValue)
+					fn.data.typeArgumentLocalOffset = memory->offset;
+				else if (value.kind == Context)
+					fn.data.closureContextLocalOffset = memory->offset;
+			}
+		}
+		// Only consume proven argument loads; descriptor arithmetic and other
+		// constants remain visible until their complete protocol is established.
+		InsnCursor cursor{fn.instructions, fn.targets, i};
+		const auto memory = readMemory(cursor);
+		if (memory && memory->load && registers[memory->value].kind == Value)
+			ranges.push_back({begin, instruction.address + 4});
+	}
+	if (inferredDeclaration && std::none_of(fn.data.params.params.begin(),
+								   fn.data.params.params.end(),
+								   [](const FnParamInfo& parameter) { return bool(parameter.val); }))
+		fn.data.params = FnParams{};
+	if (fn.data.params.empty())
+		ranges.clear();
+	ranges.insert(ranges.end(), typeArgumentRanges.begin(), typeArgumentRanges.end());
+	// Publish each proved protocol as one span, not a copy of the complete
+	// parameter list on every CMP/MOV/branch. Boundaries must already be IL
+	// boundaries; a range never cuts an unrelated compound instruction.
+	std::unordered_map<uint64_t, uint64_t> setups;
+	for (const auto& range : ranges)
+		setups[range.start] = range.end;
+	std::vector<std::unique_ptr<ILInstr>> result;
+	result.reserve(fn.data.il_insns.size());
+	for (size_t i = 0; i < fn.data.il_insns.size(); ++i) {
+		auto& il = fn.data.il_insns[i];
+		const auto range = setups.find(il->Start());
+		if (range != setups.end()) {
+			size_t last = i;
+			while (last + 1 < fn.data.il_insns.size() && fn.data.il_insns[last]->End() < range->second)
+				++last;
+			if (fn.data.il_insns[last]->End() == range->second) {
+				result.push_back(std::make_unique<SetupParametersInstr>(
+					AddrRange{il->Start(), range->second}, &fn.data.params));
+				i = last;
+				continue;
+			}
+		}
+		result.push_back(std::move(il));
+	}
+	fn.data.il_insns = std::move(result);
+	// Declaration completeness, default recovery and physical locations are
+	// separate. Do not mark an optional signature complete from a partial path.
+}
+
+void FunctionAnalyzer::recoverParameters()
+{
+	// Prefer a surviving VM declaration over guesses from stack offsets.
+	// Optional dispatch changes stack offsets, so only
+	// fixed-arity declarations receive direct FP-slot bindings here.
+	auto& function = data.dartFn;
+	if (function.Ptr() == dart::Function::null())
+		return;
+	const auto& vm = dart::Function::Handle(function.Ptr());
+	const auto& signature = dart::FunctionType::Handle(vm.signature());
+	const bool accessor = function.Kind() == DartFunction::GETTER || function.Kind() == DartFunction::SETTER;
+	if (signature.IsNull() && !accessor)
+		return;
+	const auto count = signature.IsNull()
+						   ? vm.NumImplicitParameters() + (function.Kind() == DartFunction::SETTER)
+						   : vm.NumParameters();
+	if (count < 0 || count > UINT8_MAX)
+		return;
+	data.params.numFixedParam = signature.IsNull() ? count : vm.num_fixed_parameters();
+	data.params.isNamedParam = !signature.IsNull() && vm.HasOptionalNamedParameters();
+	const bool fixed = count == data.params.numFixedParam;
+	for (intptr_t i = 0; i < count; ++i) {
+		FnParamInfo parameter;
+		if (i < function.NumParam()) {
+			const auto& declaration = function.Params()[i];
+			parameter.name = declaration.name;
+			if (declaration.type && declaration.type->IsType())
+				parameter.type = declaration.type->AsType();
+		}
+		if (!function.IsStatic() && !function.IsClosure() && i == 0) {
+			parameter.name = "this";
+			parameter.type = function.Class().DeclarationType();
+		}
+		if (fixed && data.useFramePointer) {
+			const auto offset = (count - i + 1) * dart::kWordSize;
+			for (const auto& incoming : data.incomingParameters) {
+				if (incoming.paramOffset != offset)
+					continue;
+				parameter.paramOffset = offset;
+				parameter.valReg = incoming.valReg;
+				break;
+			}
+		}
+		data.params.add(std::move(parameter));
+	}
+	// A declaration does not recover erased defaults or an optional entry path.
+	data.params.isPartial = !fixed;
+}
+
+void FunctionAnalyzer::processPrologueParameters()
+{
+	// Fold only entry FP loads backed by a complete fixed-arity declaration.
+	// Stack allocation/checks and unrelated prologue instructions remain IL.
+	if (data.params.empty() || data.params.isPartial || !data.useFramePointer)
+		return;
+	size_t boundary = instructions.Count();
+	for (size_t i = 0; i < instructions.Count(); ++i) {
+		const auto* insn = instructions.Ptr(i);
+		if (i && targets.contains(insn->address)) {
+			boundary = i;
+			break;
+		}
+		if (insn->id == ARM_INS_B || insn->id == ARM_INS_BL || insn->id == ARM_INS_BX ||
+			insn->id == ARM_INS_BLX) {
+			const bool stackCheck =
+				std::any_of(data.il_insns.begin(), data.il_insns.end(), [&](const auto& il) {
+					return il->Kind() == ILInstr::CheckStackOverflow && il->End() == insn->address + 4;
+				});
+			if (!stackCheck) {
+				boundary = i;
+				break;
+			}
+		}
+	}
+	if (!boundary)
+		return;
+	const auto end = instructions.Ptr(boundary - 1)->address + 4;
+	for (size_t i = 0; i < data.il_insns.size(); ++i) {
+		auto& il = data.il_insns[i];
+		if (il->Start() >= end)
+			break;
+		if (il->Kind() != ILInstr::Unknown)
+			continue;
+		const auto index = data.asmTexts.AtIndex(il->Start());
+		InsnCursor cursor{instructions, targets, index};
+		const auto load = readMemory(cursor);
+		if (!load || !load->load || load->base != CSREG_DART_FP || load->size != 4)
+			continue;
+		const bool parameter = std::any_of(data.params.params.begin(),
+			data.params.params.end(),
+			[&](const auto& item) { return item.paramOffset == load->offset && item.valReg == load->value; });
+		if (!parameter)
+			continue;
+		il = std::make_unique<SetupParametersInstr>(il->Range(), &data.params);
+		if (!i || targets.contains(il->Start()))
+			continue;
+		auto& previous = data.il_insns[i - 1];
+		if (previous->Kind() != ILInstr::SetupParameters || previous->End() != il->Start())
+			continue;
+		previous =
+			std::make_unique<SetupParametersInstr>(AddrRange{previous->Start(), il->End()}, &data.params);
+		data.il_insns.erase(data.il_insns.begin() + i--);
+	}
+}
 
 std::unique_ptr<ILInstr> FunctionAnalyzer::processSaveRegisterInstr(InsnCursor& insn)
 {
@@ -1695,6 +2469,180 @@ void FunctionAnalyzer::processSavedRegisters()
 			continue;
 		save = std::make_unique<SaveRegisterInstr>(save->Range(), registers);
 		restore = std::make_unique<RestoreRegisterInstr>(restore->Range(), std::move(registers));
+	}
+}
+
+void FunctionAnalyzer::recoverRegisterParameters()
+{
+#if __has_include("vm/compiler/backend/dart_calling_conventions.h")
+	// Modern AOT Dart uses r1/r2/r3/r8, not the native r0-r3 ABI. Kernel
+	// unboxing metadata and the use_register_cc flag are erased from AOT, so
+	// publish observed entry sources separately, without inventing ordinals.
+	const auto& function = data.dartFn;
+	if (function.Ptr() == dart::Function::null())
+		return;
+	const auto& vm = dart::Function::Handle(function.Ptr());
+	if (!vm.IsRegularFunction() && vm.kind() != dart::UntaggedFunction::kConstructor &&
+		function.Kind() != DartFunction::GETTER && function.Kind() != DartFunction::SETTER)
+		return;
+	const auto& signature = dart::FunctionType::Handle(vm.signature());
+	if (!signature.IsNull() && vm.IsGeneric())
+		return;
+	std::array<Reg, Reg::kNumberOfRegisters> sources{};
+	std::array<bool, Reg::kNumberOfRegisters> observed{};
+	std::array<int32_t, Reg::kNumberOfRegisters> spills{};
+	std::vector<Reg> incoming;
+	for (auto reg : dart::DartCallingConvention::kCpuRegistersForArgs) {
+		sources[Reg{reg}] = Reg{reg};
+		incoming.push_back(Reg{reg});
+	}
+	// ARM allocates floating parameters in Q registers but accesses a double
+	// through the even D register. Track overlapping S/D/Q writes together.
+	for (auto reg : dart::DartCallingConvention::kFpuRegistersForArgs) {
+		const int group = int(reg);
+		const Reg value{static_cast<Reg::Value>(Reg::D0 + group * 2)};
+		incoming.push_back(value);
+		sources[value] = value;
+		sources[Reg::Q0 + group] = value;
+		if (group < 8) {
+			sources[Reg::S0 + group * 4] = value;
+			sources[Reg::S0 + group * 4 + 1] = value;
+		}
+	}
+	std::unordered_set<uint64_t> stackChecks;
+	for (const auto& il : data.il_insns)
+		if (il->Kind() == ILInstr::CheckStackOverflow)
+			stackChecks.insert(il->End() - 4);
+	for (size_t i = 0; i < instructions.Count(); ++i) {
+		const auto& instruction = *instructions.Ptr(i);
+		if (i && targets.contains(instruction.address))
+			break;
+		const auto& arm = instruction.detail->arm;
+		if (stackChecks.contains(instruction.address))
+			continue;
+		if (!isUnconditional(instruction))
+			break;
+		const auto* groups = instruction.detail->groups;
+		if (std::any_of(groups, groups + instruction.detail->groups_count, [](uint8_t group) {
+				return group == CS_GRP_JUMP || group == CS_GRP_CALL || group == CS_GRP_RET;
+			}))
+			break;
+		const auto read = [&](int capstone) {
+			Reg reg{static_cast<arm_reg>(capstone)};
+			if (reg.IsSet() && sources[reg].IsSet())
+				observed[sources[reg]] = true;
+		};
+		// XOR/subtract of the same unshifted value is a zeroing idiom, not
+		// evidence of an incoming argument (notably VEOR Q0,Q0,Q0).
+		const bool zero = (instruction.id == ARM_INS_EOR || instruction.id == ARM_INS_VEOR ||
+							  instruction.id == ARM_INS_SUB) &&
+						  arm.op_count == 3 && arm.operands[1].type == ARM_OP_REG &&
+						  isReg(arm.operands[2], arm.operands[1].reg) &&
+						  arm.operands[1].shift.type == ARM_SFT_INVALID;
+		for (unsigned j = 0; j < arm.op_count; ++j) {
+			const auto& op = arm.operands[j];
+			if (!zero && op.type == ARM_OP_REG && (op.access & CS_AC_READ))
+				read(op.reg);
+			if (op.type == ARM_OP_MEM) {
+				read(op.mem.base);
+				read(op.mem.index);
+			}
+		}
+		InsnCursor cursor{instructions, targets, i};
+		const auto memory = readMemory(cursor);
+		if (memory && !memory->load && memory->base == CSREG_DART_FP &&
+			(memory->size == dart::kWordSize || (memory->size == 8 && memory->value.IsDecimal()))) {
+			const auto source = sources[memory->value];
+			if (source.IsSet() && memory->offset < 0)
+				spills[source] = memory->offset;
+		}
+		Reg moved;
+		if (cursor.Is(ARM_INS_MOV, 2) && arm.operands[1].type == ARM_OP_REG) {
+			Reg source{static_cast<arm_reg>(arm.operands[1].reg)};
+			if (source.IsSet() && arm.operands[1].shift.type == ARM_SFT_INVALID)
+				moved = sources[source];
+		}
+		for (unsigned j = 0; j < arm.op_count; ++j) {
+			const auto& op = arm.operands[j];
+			Reg reg{static_cast<arm_reg>(op.reg)};
+			if (op.type != ARM_OP_REG || !reg.IsSet() || !(op.access & CS_AC_WRITE))
+				continue;
+			if (!reg.IsDecimal()) {
+				sources[reg].Clear();
+				continue;
+			}
+			if (reg >= Reg{Reg::Q0}) {
+				const int group = int(reg) - Reg::Q0;
+				sources[reg].Clear();
+				sources[Reg::D0 + group * 2].Clear();
+				sources[Reg::D0 + group * 2 + 1].Clear();
+				if (group < 8)
+					for (int lane = 0; lane < 4; ++lane)
+						sources[Reg::S0 + group * 4 + lane].Clear();
+			} else if (reg >= Reg{Reg::S0}) {
+				const int lane = int(reg) - Reg::S0;
+				sources[reg].Clear();
+				sources[Reg::D0 + lane / 2].Clear();
+				sources[Reg::Q0 + lane / 4].Clear();
+			} else {
+				const int lane = int(reg) - Reg::D0;
+				sources[reg].Clear();
+				sources[Reg::Q0 + lane / 2].Clear();
+				if (lane < 16) {
+					sources[Reg::S0 + lane * 2].Clear();
+					sources[Reg::S0 + lane * 2 + 1].Clear();
+				}
+			}
+		}
+		if (moved.IsSet())
+			sources[Reg{static_cast<arm_reg>(arm.operands[0].reg)}] = moved;
+	}
+	for (auto reg : incoming) {
+		if (!observed[reg])
+			continue;
+		FnParamInfo parameter;
+		parameter.paramReg = Reg{reg};
+		parameter.localOffset = spills[Reg{reg}];
+		parameter.name = std::string("arg_") + Reg{reg}.Name();
+		data.incomingParameters.push_back(std::move(parameter));
+	}
+#endif
+}
+
+void FunctionAnalyzer::recoverIncomingParameters()
+{
+	// Observe stack entry loads independently of modern register arguments.
+	// Record observed entry loads, without inferring arity from the largest
+	// offset: signatures and optional-argument dispatch may be trimmed in AOT.
+	if (!data.useFramePointer)
+		return;
+	uint64_t frameEnd = 0;
+	std::unordered_set<uint64_t> stackChecks;
+	for (const auto& il : data.il_insns) {
+		if (!frameEnd && il->Kind() == ILInstr::EnterFrame)
+			frameEnd = il->End();
+		if (il->Kind() == ILInstr::CheckStackOverflow)
+			stackChecks.insert(il->End() - 4);
+	}
+	for (size_t i = 0; i < instructions.Count(); ++i) {
+		const auto& insn = *instructions.Ptr(i);
+		if (i && targets.contains(insn.address))
+			break;
+		if (stackChecks.contains(insn.address))
+			continue;
+		if (insn.id == ARM_INS_B || insn.id == ARM_INS_BL || insn.id == ARM_INS_BX || insn.id == ARM_INS_BLX)
+			break;
+		if (insn.address < frameEnd)
+			continue;
+		InsnCursor cursor{instructions, targets, i};
+		const auto memory = readMemory(cursor);
+		if (!memory || !memory->load || memory->size != 4 || memory->base != CSREG_DART_FP)
+			continue;
+		if (memory->offset < 8 || memory->offset % 4 || memory->value.IsDecimal())
+			continue;
+		FnParamInfo parameter{memory->value};
+		parameter.paramOffset = memory->offset;
+		data.incomingParameters.push_back(std::move(parameter));
 	}
 }
 
@@ -1891,6 +2839,11 @@ void FunctionAnalyzer::asm2il()
 		emit(std::move(il), i, end);
 		i = end;
 	}
+	recoverIncomingParameters();
+	recoverRegisterParameters();
+	recoverParameters();
+	ArmParameterRecovery{*this}.Recover();
+	processPrologueParameters();
 	processSavedRegisters();
 }
 } // namespace

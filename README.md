@@ -138,7 +138,9 @@ python blutter.py path/to/app.apk output --arch arm
 
 The ARM backend uses the SDK's ARM ABI and A32 instructions. It recognizes
 frames, stack checks, object pools, constants, direct and indirect calls,
-register moves, and returns. Unrecognized instructions retain their original
+register moves, returns, class IDs, integer boxing/unboxing, fixed-size inline
+allocation, type-test stubs, async initialization, runtime/closure/dispatch calls,
+and paired CPU/FPU register preservation scopes. Unrecognized instructions retain their original
 assembly.
 
 ARM snapshots require a **32-bit Blutter and Dart runtime**, without pointer

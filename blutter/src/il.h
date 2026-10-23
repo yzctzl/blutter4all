@@ -232,31 +232,49 @@ protected:
 class SaveRegisterInstr : public ILInstr {
 public:
 	SaveRegisterInstr(AddrRange addrRange, CpuRegister srcReg) : ILInstr(SaveRegister, addrRange), srcReg(srcReg) {}
+	SaveRegisterInstr(AddrRange range, std::vector<CpuRegister> regs)
+		: ILInstr(SaveRegister, range), srcReg(regs.empty() ? CpuRegister{} : regs.front()), registers(std::move(regs)) {}
 	SaveRegisterInstr() = delete;
 	SaveRegisterInstr(SaveRegisterInstr&&) = delete;
 	SaveRegisterInstr& operator=(const SaveRegisterInstr&) = delete;
 
 	virtual std::string ToString() {
-		return std::string("SaveReg ") + srcReg.Name();
+		std::string text = "SaveReg ";
+		if (registers.empty()) return text + srcReg.Name();
+		for (const auto reg : registers) {
+			if (text.back() != ' ') text += ", ";
+			text += reg.Name();
+		}
+		return text;
 	}
 
 protected:
 	CpuRegister srcReg;
+	std::vector<CpuRegister> registers;
 };
 
 class RestoreRegisterInstr : public ILInstr {
 public:
 	RestoreRegisterInstr(AddrRange addrRange, CpuRegister dstReg) : ILInstr(RestoreRegister, addrRange), dstReg(dstReg) {}
+	RestoreRegisterInstr(AddrRange range, std::vector<CpuRegister> regs)
+		: ILInstr(RestoreRegister, range), dstReg(regs.empty() ? CpuRegister{} : regs.front()), registers(std::move(regs)) {}
 	RestoreRegisterInstr() = delete;
 	RestoreRegisterInstr(RestoreRegisterInstr&&) = delete;
 	RestoreRegisterInstr& operator=(const RestoreRegisterInstr&) = delete;
 
 	virtual std::string ToString() {
-		return std::string("RestoreReg ") + dstReg.Name();
+		std::string text = "RestoreReg ";
+		if (registers.empty()) return text + dstReg.Name();
+		for (const auto reg : registers) {
+			if (text.back() != ' ') text += ", ";
+			text += reg.Name();
+		}
+		return text;
 	}
 
 protected:
 	CpuRegister dstReg;
+	std::vector<CpuRegister> registers;
 };
 
 class SetupParametersInstr : public ILInstr {
@@ -296,7 +314,7 @@ public:
 	GdtCallInstr& operator=(const GdtCallInstr&) = delete;
 
 	virtual std::string ToString() {
-#if defined(TARGET_ARCH_X64)
+#if defined(TARGET_ARCH_X64) || defined(TARGET_ARCH_ARM)
 		return std::format("{} = GDT[cid_{} + {:#x}]()",
 			CpuRegister{dart::CallingConventions::kReturnReg}.Name(),
 			CpuRegister{dart::DispatchTableNullErrorABI::kClassIdReg}.Name(), offset);
@@ -386,6 +404,8 @@ public:
 		std::unique_ptr<BranchIfSmiInstr> il_branchIfSmi, std::unique_ptr<LoadClassIdInstr> il_loadClassId) 
 		: ILInstr(LoadTaggedClassIdMayBeSmi, addrRange), taggedCidReg(il_loadClassId->cidReg), objReg(il_loadClassId->objReg),
 		il_loadImm(std::move(il_loadImm)), il_branchIfSmi(std::move(il_branchIfSmi)), il_loadClassId(std::move(il_loadClassId)) {}
+	LoadTaggedClassIdMayBeSmiInstr(AddrRange range, CpuRegister object, CpuRegister cid)
+		: ILInstr(LoadTaggedClassIdMayBeSmi, range), taggedCidReg(cid), objReg(object) {}
 	LoadTaggedClassIdMayBeSmiInstr() = delete;
 	LoadTaggedClassIdMayBeSmiInstr(LoadTaggedClassIdMayBeSmiInstr&&) = delete;
 	LoadTaggedClassIdMayBeSmiInstr& operator=(const LoadTaggedClassIdMayBeSmiInstr&) = delete;
@@ -403,33 +423,39 @@ public:
 
 class BoxInt64Instr : public ILInstr {
 public:
-	BoxInt64Instr(AddrRange addrRange, CpuRegister objReg, CpuRegister srcReg) : ILInstr(BoxInt64, addrRange), objReg(objReg), srcReg(srcReg) {}
+	BoxInt64Instr(AddrRange addrRange, CpuRegister objReg, CpuRegister srcReg, CpuRegister highReg = {}) : ILInstr(BoxInt64, addrRange), objReg(objReg), srcReg(srcReg), highReg(highReg) {}
 	BoxInt64Instr() = delete;
 	BoxInt64Instr(BoxInt64Instr&&) = delete;
 	BoxInt64Instr& operator=(const BoxInt64Instr&) = delete;
 
 	virtual std::string ToString() {
+		if (highReg.IsSet())
+			return std::format("{} = BoxInt64Instr({}, {})", objReg.Name(), srcReg.Name(), highReg.Name());
 		return std::format("{} = BoxInt64Instr({})", objReg.Name(), srcReg.Name());
 	}
 
 	CpuRegister objReg;
 	CpuRegister srcReg;
+	CpuRegister highReg; // ARM32 input is a low/high register pair.
 };
 
 class UnboxIntInstr : public ILInstr {
 public:
-	UnboxIntInstr(AddrRange addrRange, CpuRegister dstReg, CpuRegister srcObjReg, int bits) : ILInstr(UnboxInt, addrRange), dstReg(dstReg), srcObjReg(srcObjReg), bits(bits) {}
+	UnboxIntInstr(AddrRange addrRange, CpuRegister dstReg, CpuRegister srcObjReg, int bits, CpuRegister highReg = {}) : ILInstr(UnboxInt, addrRange), dstReg(dstReg), srcObjReg(srcObjReg), bits(bits), highReg(highReg) {}
 	UnboxIntInstr() = delete;
 	UnboxIntInstr(UnboxIntInstr&&) = delete;
 	UnboxIntInstr& operator=(const UnboxIntInstr&) = delete;
 
 	virtual std::string ToString() {
+		if (highReg.IsSet())
+			return std::format("({}, {}) = UnboxInt{}Instr({})", dstReg.Name(), highReg.Name(), bits, srcObjReg.Name());
 		return std::format("{} = UnboxInt{}Instr({})", dstReg.Name(), bits, srcObjReg.Name());
 	}
 
 	CpuRegister dstReg;
 	CpuRegister srcObjReg;
 	int bits;
+	CpuRegister highReg; // ARM32 represents an unboxed int64 as low/high words.
 };
 
 class AllocateObjectInstr : public ILInstr {

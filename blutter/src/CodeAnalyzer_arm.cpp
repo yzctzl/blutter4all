@@ -254,9 +254,25 @@ class FunctionAnalyzer
 	std::unique_ptr<ILInstr> processAllocateStackInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processCheckStackOverflowInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processObjectPoolInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processLoadClassIdInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processBranchIfSmiInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processCallInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processPoolCallInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processCallLeafRuntimeInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processGdtCallInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processClosureCallInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processUnboxIntInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processInitAsyncInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processTypeTestInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processInlineTypeTestInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processTryAllocateObjectInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processTailCallInstr(InsnCursor& insn);
+	LoadValueInstr* previousLoad(const InsnCursor& insn);
+	std::unique_ptr<ILInstr> processBoxInt64Instr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processTaggedClassIdInstr(InsnCursor& insn);
+	void processSavedRegisters();
+	std::unique_ptr<ILInstr> processSaveRegisterInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processLoadSavedRegisterInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processReturnInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processMoveRegInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processLoadValueInstr(InsnCursor& insn);
@@ -427,6 +443,54 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processPoolAccess(InsnCursor& insn, b
 	return poolLoad(insn, high + memory->offset, memory->value, store);
 }
 
+std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadClassIdInstr(InsnCursor& insn)
+{
+	// assembler_arm.cc LoadClassId / LoadClassIdMayBeSmi. UBFX extracts the
+	// 20-bit CID at bit 12; this is not ARM64's shift-only tags encoding.
+	bool mayBeSmi = insn.Is(ARM_INS_TST, 2) && isImm(insn.op(1), dart::kSmiTagMask);
+	arm_reg object = ARM_REG_INVALID;
+	arm_cc cc = ARM_CC_AL;
+	if (mayBeSmi) {
+		object = static_cast<arm_reg>(insn.op(0).reg);
+		cc = ARM_CC_NE;
+		if (!insn.Next())
+			return nullptr;
+	}
+	if (!insn.Is(ARM_INS_LDR, 2, cc) || insn.detail().writeback)
+		return nullptr;
+	if (!isMemory(insn.op(1), insn.op(1).mem.base) || insn.op(1).mem.disp != -dart::kHeapObjectTag)
+		return nullptr;
+	if (mayBeSmi && insn.op(1).mem.base != object)
+		return nullptr;
+	object = static_cast<arm_reg>(insn.op(1).mem.base);
+	const auto cid = insn.op(0).reg;
+	if (!insn.Next() || !insn.Is(ARM_INS_UBFX, 4, cc))
+		return nullptr;
+	if (!isReg(insn.op(0), cid) || !isReg(insn.op(1), cid))
+		return nullptr;
+	if (!isImm(insn.op(2), kUntaggedObjectClassIdTagPos) ||
+		!isImm(insn.op(3), dart::UntaggedObject::kClassIdTagSize))
+		return nullptr;
+	if (mayBeSmi) {
+		if (!insn.Next() || !insn.Is(ARM_INS_MOV, 2, ARM_CC_EQ))
+			return nullptr;
+		if (!isReg(insn.op(0), cid) || !isImm(insn.op(1), dart::kSmiCid))
+			return nullptr;
+	}
+	return std::make_unique<LoadClassIdInstr>(
+		insn.Range(), Reg{object}, Reg{static_cast<arm_reg>(cid)}, mayBeSmi);
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processBranchIfSmiInstr(InsnCursor& insn)
+{
+	if (!insn.Is(ARM_INS_TST, 2) || insn.op(0).type != ARM_OP_REG || !isImm(insn.op(1), dart::kSmiTagMask))
+		return nullptr;
+	const auto object = static_cast<arm_reg>(insn.op(0).reg);
+	if (!insn.Next() || !insn.Is(ARM_INS_B, 1, ARM_CC_EQ) || insn.op(0).type != ARM_OP_IMM)
+		return nullptr;
+	return std::make_unique<BranchIfSmiInstr>(insn.Range(), Reg{object}, uint32_t(insn.op(0).imm));
+}
+
 std::unique_ptr<ILInstr> FunctionAnalyzer::processCallInstr(InsnCursor& insn)
 {
 	if (insn.Is(ARM_INS_BL, 1) && insn.op(0).type == ARM_OP_IMM) {
@@ -492,6 +556,49 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processPoolCallInstr(InsnCursor& insn
 	return std::make_unique<CallInstr>(insn.Range(), function, address);
 }
 
+std::unique_ptr<ILInstr> FunctionAnalyzer::processCallLeafRuntimeInstr(InsnCursor& insn)
+{
+	// Leaf runtime entries are loaded from THR, then called through BLX.
+	auto memory = readMemory(insn);
+	if (!memory || !memory->load || memory->size != 4 || memory->base != CSREG_DART_THR)
+		return nullptr;
+	if (!GetThreadLeafFunction(memory->offset))
+		return nullptr;
+	const auto target = insn.op(0).reg;
+	if (!insn.Next())
+		return nullptr;
+	// LeafRuntimeScope::Call stores the native entry as vm_tag before BLX.
+	// The short form has no tag stores; a partial protocol is not accepted.
+	const auto tag = readMemory(insn);
+	if (tag) {
+		if (tag->load || tag->size != dart::kWordSize)
+			return nullptr;
+		if (tag->base != CSREG_DART_THR || tag->offset != AOT_Thread_vm_tag_offset)
+			return nullptr;
+		if (tag->value != Reg{static_cast<arm_reg>(target)})
+			return nullptr;
+		if (!insn.Next())
+			return nullptr;
+	}
+	if (!insn.Is(ARM_INS_BLX, 1) || !isReg(insn.op(0), target))
+		return nullptr;
+	if (tag) {
+		if (!insn.Next())
+			return nullptr;
+		arm_reg reset;
+		const auto dartTag = readImmediate(insn, reset);
+		if (!dartTag || *dartTag != dart::VMTag::kDartTagId || reset != target || !insn.Next())
+			return nullptr;
+		const auto restore = readMemory(insn);
+		if (!restore || restore->load || restore->size != dart::kWordSize || restore->base != tag->base ||
+			restore->offset != tag->offset)
+			return nullptr;
+		if (restore->value != tag->value)
+			return nullptr;
+	}
+	return std::make_unique<CallLeafRuntimeInstr>(insn.Range(), memory->offset);
+}
+
 std::unique_ptr<ILInstr> FunctionAnalyzer::processReturnInstr(InsnCursor& insn)
 {
 	const bool linkReturn = insn.Is(ARM_INS_BX, 1) && isReg(insn.op(0), ARM_REG_LR);
@@ -552,7 +659,383 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadValueInstr(InsnCursor& ins
 		VarItem{VarStorage::NewImmediate(), new VarInteger(int32_t(*value), VarValue::NativeInt)});
 }
 
+std::unique_ptr<ILInstr> FunctionAnalyzer::processGdtCallInstr(InsnCursor& insn)
+{
+	// FlowGraphCompiler::EmitDispatchTableCall: CID scaled by target word size,
+	// an optional selector displacement, then load LR and BLX LR.
+	const auto table = ToCapstoneReg(dart::DISPATCH_TABLE_REG);
+	const auto cid = ToCapstoneReg(dart::DispatchTableNullErrorABI::kClassIdReg);
+	const auto scaledCid = [&](const cs_arm_op& op) {
+		return op.type == ARM_OP_REG && op.reg == cid && op.shift.type == ARM_SFT_LSL && op.shift.value == 2;
+	};
+	int64_t offset = 0;
+	if (insn.Is(ARM_INS_ADD, 3)) {
+		if (!isReg(insn.op(0), ARM_REG_LR) || !isReg(insn.op(1), table) || !scaledCid(insn.op(2)))
+			return nullptr;
+		if (!insn.Next())
+			return nullptr;
+		if (insn.Is(ARM_INS_ADD, 3) || insn.Is(ARM_INS_SUB, 3)) {
+			if (!isReg(insn.op(0), ARM_REG_LR) || !isReg(insn.op(1), ARM_REG_LR) ||
+				insn.op(2).type != ARM_OP_IMM)
+				return nullptr;
+			offset = insn.op(2).imm * (insn.Current()->id == ARM_INS_SUB ? -1 : 1);
+			if (!insn.Next())
+				return nullptr;
+		}
+		auto memory = readMemory(insn);
+		if (!memory || !memory->load || memory->size != dart::kWordSize || memory->base != ARM_REG_LR ||
+			memory->value != Reg{dart::R14})
+			return nullptr;
+		offset += memory->offset;
+	} else {
+		if (!insn.Is(ARM_INS_LDR, 2) || insn.detail().writeback || !isReg(insn.op(0), ARM_REG_LR))
+			return nullptr;
+		const auto& memory = insn.op(1);
+		if (memory.type != ARM_OP_MEM || memory.mem.base != table || memory.mem.index != cid ||
+			memory.subtracted)
+			return nullptr;
+		if (memory.shift.type != ARM_SFT_LSL || memory.shift.value != 2)
+			return nullptr;
+	}
+	if (offset % dart::kWordSize || !insn.Next() || !insn.Is(ARM_INS_BLX, 1) ||
+		!isReg(insn.op(0), ARM_REG_LR))
+		return nullptr;
+	return std::make_unique<GdtCallInstr>(insn.Range(), offset / dart::kWordSize);
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processUnboxIntInstr(InsnCursor& insn)
+{
+	// il_arm.cc EmitLoadInt64FromBoxOrSmi also sign-fills a distinct high
+	// register before untagging. Preserve the pair in IL rather than hiding
+	// the upper word or confusing the two Mint loads with object fields.
+	Reg high;
+	arm_reg pairSource = ARM_REG_INVALID;
+	if (isArithmeticShift(insn, 31) && !insn.detail().update_flags) {
+		if (insn.op(0).type != ARM_OP_REG || insn.op(1).type != ARM_OP_REG)
+			return nullptr;
+		high = Reg{static_cast<arm_reg>(insn.op(0).reg)};
+		pairSource = static_cast<arm_reg>(insn.op(1).reg);
+		if (high == Reg{pairSource} || !insn.Next())
+			return nullptr;
+	}
+	// assembler_arm.h LoadInt32FromBoxOrSmi: ASRS exposes the Smi tag in
+	// carry; BCC skips exactly one Mint payload load. A bare ASR is ambiguous.
+	if (!isArithmeticShift(insn, dart::kSmiTagSize) || !insn.detail().update_flags)
+		return nullptr;
+	if (insn.op(0).type != ARM_OP_REG || insn.op(1).type != ARM_OP_REG)
+		return nullptr;
+	const auto dst = static_cast<arm_reg>(insn.op(0).reg), src = static_cast<arm_reg>(insn.op(1).reg);
+	if (dst == src || (high.IsSet() && (src != pairSource || high == Reg{dst})))
+		return nullptr;
+	if (!insn.Next() || !insn.Is(ARM_INS_B, 1, ARM_CC_LO) || insn.op(0).type != ARM_OP_IMM)
+		return nullptr;
+	const auto done = uint32_t(insn.op(0).imm);
+	if (!insn.Next())
+		return nullptr;
+	const auto memory = readMemory(insn);
+	if (!memory || !memory->load || memory->size != 4 || memory->base != src || memory->value != Reg{dst})
+		return nullptr;
+	if (memory->offset != AOT_Mint_value_offset - dart::kHeapObjectTag)
+		return nullptr;
+	if (high.IsSet()) {
+		if (!insn.Next())
+			return nullptr;
+		const auto upper = readMemory(insn);
+		if (!upper || !upper->load || upper->size != 4 || upper->base != src || upper->value != high)
+			return nullptr;
+		if (upper->offset != memory->offset + dart::kWordSize)
+			return nullptr;
+	}
+	if (done != insn.Range().end)
+		return nullptr;
+	return std::make_unique<UnboxIntInstr>(insn.Range(), Reg{dst}, Reg{src}, high.IsSet() ? 64 : 32, high);
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processClosureCallInstr(InsnCursor& insn)
+{
+	// il_arm.cc ClosureCallInstr: descriptor in r4, cached entry from closure
+	// r0 into r2, then BLX r2. The descriptor must be a valid VM array layout.
+	if (targets.contains(insn.Current()->address) || data.il_insns.empty())
+		return nullptr;
+	auto* previous = data.LastIL();
+	if (previous->Kind() != ILInstr::LoadValue || previous->End() != insn.Range().start)
+		return nullptr;
+	auto& descriptorLoad = static_cast<LoadValueInstr&>(*previous);
+	if (descriptorLoad.dstReg != Reg{dart::ARGS_DESC_REG} ||
+		descriptorLoad.val.ValueTypeId() != dart::kArrayCid)
+		return nullptr;
+	const auto memory = readMemory(insn);
+	if (!memory || !memory->load || memory->size != dart::kWordSize || memory->base != ARM_REG_R0 ||
+		memory->value != Reg{dart::R2})
+		return nullptr;
+	if (memory->offset != AOT_Closure_entry_point_offset - dart::kHeapObjectTag)
+		return nullptr;
+	if (!insn.Next() || !insn.Is(ARM_INS_BLX, 1) || !isReg(insn.op(0), ARM_REG_R2))
+		return nullptr;
+	const auto& array = dart::Array::Handle(descriptorLoad.val.Get<VarArray>()->ptr);
+	const auto header = (dart::ArgumentsDescriptor::first_named_entry_offset() - dart::Array::data_offset()) /
+						dart::kWordSize;
+	if (array.Length() <= header || (array.Length() - header - 1) % 2)
+		return nullptr;
+	for (intptr_t i = 0; i < header; ++i)
+		if (!dart::Object::Handle(array.At(i)).IsSmi())
+			return nullptr;
+	dart::ArgumentsDescriptor descriptor(array);
+	if (descriptor.Count() <= 0 || descriptor.TypeArgsLen() < 0)
+		return nullptr;
+	if (descriptor.PositionalCount() < 0 || descriptor.PositionalCount() > descriptor.Count())
+		return nullptr;
+	if (descriptor.NamedCount() != (array.Length() - header - 1) / 2)
+		return nullptr;
+	const auto start = previous->Start();
+	data.RemoveLastIL();
+	return std::make_unique<ClosureCallInstr>(
+		AddrRange{start, insn.Range().end}, descriptor.Count(), descriptor.TypeArgsLen());
+}
+
 // Folds which include a preceding pool load must not erase a branch entry.
+LoadValueInstr* FunctionAnalyzer::previousLoad(const InsnCursor& insn)
+{
+	if (targets.contains(insn.Range().start) || data.il_insns.empty())
+		return nullptr;
+	auto* previous = data.LastIL();
+	if (previous->Kind() != ILInstr::LoadValue || previous->End() != insn.Range().start)
+		return nullptr;
+	return static_cast<LoadValueInstr*>(previous);
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processInitAsyncInstr(InsnCursor& insn)
+{
+#ifdef HAS_INIT_ASYNC
+	// StubCallInstr passes the Future type arguments in r0 on ARM too.
+	if (!insn.Is(ARM_INS_BL, 1) || insn.op(0).type != ARM_OP_IMM)
+		return nullptr;
+	auto* fn = app.FindFunctionExact(uint32_t(insn.op(0).imm));
+	if (!fn || !fn->IsStub() || fn->AsStub()->kind != DartStub::InitAsyncStub)
+		return nullptr;
+	auto* load = previousLoad(insn);
+	if (!load || load->dstReg != Reg{dart::R0})
+		return nullptr;
+	auto& item = load->val;
+	DartType* type = nullptr;
+	if (item.ValueTypeId() == dart::kNullCid)
+		type = app.TypeDb()->FindOrAdd(app.DartFutureCid(), &DartTypeArguments::Null);
+	else if (item.ValueTypeId() == dart::kTypeArgumentsCid)
+		type = app.TypeDb()->FindOrAdd(app.DartFutureCid(), &item.Get<VarTypeArgument>()->typeArgs);
+	if (!type)
+		return nullptr;
+	const auto start = load->Start();
+	data.returnType = type;
+	data.RemoveLastIL();
+	return std::make_unique<InitAsyncInstr>(AddrRange{start, insn.Range().end}, type);
+#else
+	return nullptr;
+#endif
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processInlineTypeTestInstr(InsnCursor& insn)
+{
+	// GenerateCallerChecksForAssertAssignable: numeric positive fast paths
+	// branch around a proven TTS. A CID-looking branch alone is not a cast.
+	auto smi = processBranchIfSmiInstr(insn);
+	if (!smi)
+		return nullptr;
+	const auto& branch = static_cast<BranchIfSmiInstr&>(*smi);
+	if (branch.objReg != Reg{dart::TypeTestABI::kInstanceReg})
+		return nullptr;
+	const auto done = branch.branchAddr;
+	if (!insn.Next())
+		return nullptr;
+	int range = 0;
+	auto cidCursor = insn;
+	if (auto cid = processLoadClassIdInstr(cidCursor)) {
+		const auto& load = static_cast<LoadClassIdInstr&>(*cid);
+		if (load.objReg != branch.objReg)
+			return nullptr;
+		while (insn.End() < cidCursor.End())
+			insn.Next();
+		const auto reg = ToCapstoneReg(static_cast<dart::Register>(int(load.cidReg)));
+		if (!insn.Next() || !insn.Is(ARM_INS_SUB, 3) || insn.detail().update_flags)
+			return nullptr;
+		if (!isReg(insn.op(0), reg) || !isReg(insn.op(1), reg) || !isImm(insn.op(2), dart::kSmiCid))
+			return nullptr;
+		if (!insn.Next() || !insn.Is(ARM_INS_CMP, 2) || !isReg(insn.op(0), reg))
+			return nullptr;
+		if (insn.op(1).type != ARM_OP_IMM || (insn.op(1).imm != 1 && insn.op(1).imm != 2))
+			return nullptr;
+		range = insn.op(1).imm;
+		if (!insn.Next() || !insn.Is(ARM_INS_B, 1, ARM_CC_LS) || !isImm(insn.op(0), done))
+			return nullptr;
+		if (!insn.Next())
+			return nullptr;
+	}
+	auto slow = processTypeTestInstr(insn);
+	if (!slow || insn.Range().end != done)
+		return nullptr;
+	const auto& type = static_cast<TestTypeInstr&>(*slow).typeName;
+	const bool integer = type == "int" || type == "int?";
+	const bool number = type == "num" || type == "num?";
+	if (!integer && !number)
+		return nullptr;
+	if ((range == 1 && !integer) || (range == 2 && !number))
+		return nullptr;
+	return std::make_unique<TestTypeInstr>(insn.Range(), branch.objReg, type);
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processTypeTestInstr(InsnCursor& insn)
+{
+	// GenerateTTSCall: known per-type direct entry, or a type object's own
+	// entry field. A random BLX after a pool load is not a type test.
+	auto load = processObjectPoolInstr(insn);
+	if (!load)
+		return nullptr;
+	const auto& pool = app.GetObjectPool();
+	const auto poolObject = [&](const ILInstr& il) -> dart::ObjectPtr {
+		const auto& value = static_cast<const LoadValueInstr&>(il);
+		const auto index = PoolIndexFromOffset(value.val.storage.offset);
+		if (pool.TypeAt(index) != dart::ObjectPool::EntryType::kTaggedObject)
+			return dart::Object::null();
+		return pool.ObjectAt(index);
+	};
+	dart::AbstractTypePtr expected = dart::AbstractType::null();
+	arm_reg entry = ARM_REG_INVALID;
+	if (static_cast<LoadValueInstr&>(*load).dstReg == Reg{dart::TypeTestABI::kDstTypeReg}) {
+		const auto& type = dart::Object::Handle(poolObject(*load));
+		if (!type.IsAbstractType())
+			return nullptr;
+		expected = dart::AbstractType::Cast(type).ptr();
+		if (!insn.Next())
+			return nullptr;
+		const auto memory = readMemory(insn);
+		if (memory && memory->load && memory->size == dart::kWordSize &&
+			memory->base == ToCapstoneReg(dart::TypeTestABI::kDstTypeReg)) {
+			if (memory->offset != AOT_AbstractType_type_test_stub_entry_point_offset - dart::kHeapObjectTag)
+				return nullptr;
+			entry = static_cast<arm_reg>(insn.op(0).reg);
+			if (entry != ToCapstoneReg(dart::TTSInternalRegs::kScratchReg) || !insn.Next())
+				return nullptr;
+		}
+		load = processObjectPoolInstr(insn);
+		if (!load)
+			return nullptr;
+	}
+	const auto& cache = static_cast<LoadValueInstr&>(*load);
+	if (cache.dstReg != Reg{dart::TypeTestABI::kSubtypeTestCacheReg})
+		return nullptr;
+	if (pool.TypeAt(PoolIndexFromOffset(cache.val.storage.offset)) !=
+		dart::ObjectPool::EntryType::kTaggedObject)
+		return nullptr;
+	const auto& value = dart::Object::Handle(poolObject(*load));
+	if (!value.IsNull() && !value.IsSubtypeTestCache())
+		return nullptr;
+	if (!insn.Next())
+		return nullptr;
+	if (entry != ARM_REG_INVALID) {
+		if (!insn.Is(ARM_INS_BLX, 1) || !isReg(insn.op(0), entry))
+			return nullptr;
+	} else {
+		if (!insn.Is(ARM_INS_BL, 1) || insn.op(0).type != ARM_OP_IMM)
+			return nullptr;
+		auto* fn = app.FindFunctionExact(uint32_t(insn.op(0).imm));
+		if (!fn || !fn->IsStub() || fn->AsStub()->kind != DartStub::TypeCheckStub)
+			return nullptr;
+		const auto& code = dart::Code::Handle(fn->AsStub()->ptr);
+		if (code.IsNull() || uint32_t(code.EntryPoint() - uintptr_t(app.base())) != uint32_t(insn.op(0).imm))
+			return nullptr;
+		const auto& owner = dart::Object::Handle(code.owner());
+		if (!owner.IsAbstractType())
+			return nullptr;
+		const auto type = dart::AbstractType::Cast(owner).ptr();
+		if (expected != dart::AbstractType::null() && expected != type)
+			return nullptr;
+		expected = type;
+	}
+	auto* type = app.TypeDb()->FindOrAdd(expected);
+	return std::make_unique<TestTypeInstr>(
+		insn.Range(), Reg{dart::TypeTestABI::kInstanceReg}, type->ToString());
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processTryAllocateObjectInstr(InsnCursor& insn)
+{
+	// assembler_arm.cc TryAllocateObject (product): bump top, compare end,
+	// commit top, tag the result, and initialize the class/size header.
+	// ldr instance, [thr, #top]; add instance, instance, #size
+	const auto top = readMemory(insn);
+	if (!top || !top->load || top->size != dart::kWordSize)
+		return nullptr;
+	if (top->base != CSREG_DART_THR || top->offset != AOT_Thread_top_offset)
+		return nullptr;
+	const auto instance = insn.op(0).reg;
+	if (!insn.Next() || !insn.Is(ARM_INS_ADD, 3))
+		return nullptr;
+	if (!isReg(insn.op(0), instance) || !isReg(insn.op(1), instance) || insn.op(2).type != ARM_OP_IMM)
+		return nullptr;
+	const auto size = insn.op(2).imm;
+	if (size <= 0 || size % dart::kObjectAlignment)
+		return nullptr;
+	if (!insn.Next())
+		return nullptr;
+	const auto end = readMemory(insn);
+	if (!end || !end->load || end->size != dart::kWordSize)
+		return nullptr;
+	if (end->base != CSREG_DART_THR || end->offset != AOT_Thread_end_offset)
+		return nullptr;
+
+	// cmp limit, instance; bls failure. The commit must remain on the fast path.
+	const auto limit = insn.op(0).reg;
+	if (instance == limit || !insn.Next() || !insn.Is(ARM_INS_CMP, 2))
+		return nullptr;
+	if (!isReg(insn.op(0), limit) || !isReg(insn.op(1), instance))
+		return nullptr;
+	if (!insn.Next() || !insn.Is(ARM_INS_B, 1, ARM_CC_LS) || insn.op(0).type != ARM_OP_IMM)
+		return nullptr;
+	const auto failure = uint32_t(insn.op(0).imm);
+	if (failure <= insn.Current()->address || failure >= data.dartFn.AddressEnd())
+		return nullptr;
+	if (!insn.Next())
+		return nullptr;
+
+	// str instance, [thr, #top]; sub instance, instance, #(size - tag)
+	const auto commit = readMemory(insn);
+	if (!commit || commit->load || commit->size != dart::kWordSize)
+		return nullptr;
+	if (commit->base != CSREG_DART_THR || commit->offset != top->offset)
+		return nullptr;
+	if (commit->value != top->value)
+		return nullptr;
+	if (!insn.Next() || !insn.Is(ARM_INS_SUB, 3))
+		return nullptr;
+	if (!isReg(insn.op(0), instance) || !isReg(insn.op(1), instance) ||
+		!isImm(insn.op(2), size - dart::kHeapObjectTag))
+		return nullptr;
+	if (!insn.Next())
+		return nullptr;
+
+	// LoadImmediate tags; str tags, [instance, #-tag]. Cross-check both
+	// the encoded size and the VM class layout before publishing allocation IL.
+	arm_reg tags;
+	const auto header = readImmediate(insn, tags);
+	if (!header || tags == instance || !insn.Next())
+		return nullptr;
+	const auto store = readMemory(insn);
+	if (!store || store->load || store->size != 4 || store->base != instance || store->value != Reg{tags})
+		return nullptr;
+	if (store->offset != -dart::kHeapObjectTag || failure < insn.Range().end)
+		return nullptr;
+	const auto cid =
+		(*header >> kUntaggedObjectClassIdTagPos) & ((1u << dart::UntaggedObject::kClassIdTagSize) - 1);
+	auto* cls = app.FindClass(cid);
+	if (!cls || dart::UntaggedObject::SizeTag::decode(*header) != size)
+		return nullptr;
+	intptr_t layout = cls->Size();
+	if (cid == dart::kDoubleCid)
+		layout = dart::Double::InstanceSize();
+	if (cid == dart::kMintCid)
+		layout = dart::Mint::InstanceSize();
+	if (layout <= 0 || ((layout + dart::kObjectAlignment - 1) & -dart::kObjectAlignment) != size)
+		return nullptr;
+	return std::make_unique<AllocateObjectInstr>(insn.Range(), top->value, *cls);
+}
 
 std::unique_ptr<ILInstr> FunctionAnalyzer::processTailCallInstr(InsnCursor& insn)
 {
@@ -567,16 +1050,294 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processTailCallInstr(InsnCursor& insn
 	return std::make_unique<CallInstr>(insn.Range(), target, address);
 }
 
+std::unique_ptr<ILInstr> FunctionAnalyzer::processTaggedClassIdInstr(InsnCursor& insn)
+{
+	// LoadTaggedClassIdMayBeSmi = predicated LoadClassIdMayBeSmi + SmiTag.
+	auto load = processLoadClassIdInstr(insn);
+	if (!load)
+		return nullptr;
+	const auto& cid = static_cast<LoadClassIdInstr&>(*load);
+	if (!cid.mayBeSmi || !insn.Next() || !insn.Is(ARM_INS_LSL, 2) || insn.detail().update_flags)
+		return nullptr;
+	if (Reg{static_cast<arm_reg>(insn.op(0).reg)} != cid.cidReg)
+		return nullptr;
+	if (Reg{static_cast<arm_reg>(insn.op(1).reg)} != cid.cidReg)
+		return nullptr;
+	if (insn.op(1).shift.type != ARM_SFT_LSL || insn.op(1).shift.value != dart::kSmiTagSize)
+		return nullptr;
+	return std::make_unique<LoadTaggedClassIdMayBeSmiInstr>(insn.Range(), cid.objReg, cid.cidReg);
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processBoxInt64Instr(InsnCursor& insn)
+{
+	// il_arm.cc BoxInt64: compare both words with the sign-extended Smi,
+	// allocate via a known shared Mint stub, then store both payload words.
+	if (!insn.Is(ARM_INS_LSL, 2) || insn.detail().update_flags)
+		return nullptr;
+	if (insn.op(0).type != ARM_OP_REG || insn.op(1).type != ARM_OP_REG)
+		return nullptr;
+	if (insn.op(1).shift.type != ARM_SFT_LSL || insn.op(1).shift.value != dart::kSmiTagSize)
+		return nullptr;
+	const auto object = insn.op(0).reg, low = insn.op(1).reg;
+	if (object == low || !insn.Next() || !insn.Is(ARM_INS_CMP, 2))
+		return nullptr;
+	const auto compare = [&](const InsnCursor& cursor, int source, unsigned shift) {
+		if (cursor.op(1).type != ARM_OP_REG || cursor.op(1).reg != object ||
+			cursor.op(1).shift.type != ARM_SFT_ASR)
+			return false;
+		return isReg(cursor.op(0), source) && cursor.op(1).shift.value == shift;
+	};
+	if (!compare(insn, low, dart::kSmiTagSize))
+		return nullptr;
+	if (!insn.Next() || !insn.Is(ARM_INS_CMP, 2, ARM_CC_EQ) || insn.op(0).type != ARM_OP_REG)
+		return nullptr;
+	const auto high = insn.op(0).reg;
+	for (auto source : {low, high}) {
+		Reg reg{static_cast<arm_reg>(source)};
+		if (!reg.IsSet() || reg.IsDecimal() || !(dart::kDartAvailableCpuRegs & (1 << int(reg))))
+			return nullptr;
+	}
+	if (high == low || high == object || !compare(insn, high, 31))
+		return nullptr;
+	if (!insn.Next() || !insn.Is(ARM_INS_B, 1, ARM_CC_EQ) || insn.op(0).type != ARM_OP_IMM)
+		return nullptr;
+	const auto done = uint32_t(insn.op(0).imm);
+	if (!insn.Next() || object != ToCapstoneReg(dart::AllocateMintABI::kResultReg))
+		return nullptr;
+	// Frameless functions temporarily enter a Dart frame around the shared
+	// allocation call. Check both halves without changing function frame facts.
+	const bool temporaryFrame = insn.Is(ARM_INS_PUSH, 2);
+	if (temporaryFrame) {
+		if (!isReg(insn.op(0), CSREG_DART_FP) || !isReg(insn.op(1), ARM_REG_LR) || !insn.Next())
+			return nullptr;
+		bool frame = insn.Is(ARM_INS_MOV, 2) && isReg(insn.op(1), CSREG_DART_SP);
+		if (insn.Is(ARM_INS_ADD, 3))
+			frame = isReg(insn.op(1), CSREG_DART_SP) && isImm(insn.op(2), 0);
+		if (!frame || !isReg(insn.op(0), CSREG_DART_FP) || !insn.Next())
+			return nullptr;
+	}
+	bool mint = false;
+	const auto memory = readMemory(insn);
+	if (memory && memory->load && memory->size == dart::kWordSize && memory->base == CSREG_DART_THR) {
+		mint = memory->offset == AOT_Thread_allocate_mint_with_fpu_regs_entry_point_offset ||
+			   memory->offset == AOT_Thread_allocate_mint_without_fpu_regs_entry_point_offset;
+		const auto entry = static_cast<arm_reg>(insn.op(0).reg);
+		if (!mint || entry != ARM_REG_LR || !insn.Next() || !insn.Is(ARM_INS_BLX, 1) ||
+			!isReg(insn.op(0), entry))
+			return nullptr;
+	} else {
+		auto call = insn.Is(ARM_INS_BL, 1) ? processCallInstr(insn) : processPoolCallInstr(insn);
+		if (!call)
+			return nullptr;
+		// A Code/call-data pool load must not replace either source word.
+		for (size_t i = data.asmTexts.AtIndex(call->Start());
+			i < instructions.Count() && instructions.Ptr(i)->address < call->End();
+			++i) {
+			const auto& arm = instructions.Ptr(i)->detail->arm;
+			for (unsigned j = 0; j < arm.op_count; ++j)
+				if (arm.operands[j].type == ARM_OP_REG && (arm.operands[j].access & CS_AC_WRITE) &&
+					(arm.operands[j].reg == low || arm.operands[j].reg == high))
+					return nullptr;
+		}
+		auto* fn = static_cast<CallInstr&>(*call).GetFunction();
+		if (fn && fn->IsStub()) {
+			const auto kind = fn->AsStub()->kind;
+			mint = kind == DartStub::AllocateMintSharedWithFPURegsStub ||
+				   kind == DartStub::AllocateMintSharedWithoutFPURegsStub;
+			const auto& code = dart::Code::Handle(fn->AsStub()->ptr);
+			if (code.IsNull() || static_cast<CallInstr&>(*call).GetCallAddress() !=
+									 uint32_t(code.EntryPoint() - uintptr_t(app.base())))
+				return nullptr;
+		}
+	}
+	if (!mint)
+		return nullptr;
+	if (temporaryFrame) {
+		if (!insn.Next())
+			return nullptr;
+		bool restore = insn.Is(ARM_INS_MOV, 2) && isReg(insn.op(1), CSREG_DART_FP);
+		if (insn.Is(ARM_INS_SUB, 3))
+			restore = isReg(insn.op(1), CSREG_DART_FP) && isImm(insn.op(2), 0);
+		if (!restore || !isReg(insn.op(0), CSREG_DART_SP) || !insn.Next())
+			return nullptr;
+		if (!insn.Is(ARM_INS_POP, 2) || !isReg(insn.op(0), CSREG_DART_FP) || !isReg(insn.op(1), ARM_REG_LR))
+			return nullptr;
+	}
+	for (int word = 0; word < 2; ++word) {
+		if (!insn.Next())
+			return nullptr;
+		const auto store = readMemory(insn);
+		if (!store || store->load || store->size != 4 || store->base != object)
+			return nullptr;
+		if (store->value != Reg{static_cast<arm_reg>(word ? high : low)})
+			return nullptr;
+		if (store->offset != AOT_Mint_value_offset - dart::kHeapObjectTag + word * dart::kWordSize)
+			return nullptr;
+	}
+	if (done != insn.Range().end)
+		return nullptr;
+	return std::make_unique<BoxInt64Instr>(insn.Range(),
+		Reg{static_cast<arm_reg>(object)},
+		Reg{static_cast<arm_reg>(low)},
+		Reg{static_cast<arm_reg>(high)});
+}
+
 // PrologueBuilder produces descriptor arithmetic, followed by supplied/default
 // diamonds. Track only those expressions; do not interpret arbitrary body code.
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processSaveRegisterInstr(InsnCursor& insn)
+{
+	// PushRegisters(FPU): reserve space, copy SP to IP, VSTMIA IP! pairs.
+	// Prove the matching stub call and VPOP sequence before consuming a save.
+	if (!insn.Is(ARM_INS_SUB, 3) || !isReg(insn.op(0), CSREG_DART_SP) || !isReg(insn.op(1), CSREG_DART_SP))
+		return nullptr;
+	if (insn.op(2).type != ARM_OP_IMM)
+		return nullptr;
+	const auto size = insn.op(2).imm;
+	if (size <= 0 || size > 32 * 8 || size % 16)
+		return nullptr;
+	if (!insn.Next() || !insn.Is(ARM_INS_MOV, 2))
+		return nullptr;
+	if (!isReg(insn.op(0), ARM_REG_R12) || !isReg(insn.op(1), CSREG_DART_SP))
+		return nullptr;
+	std::vector<CpuRegister> regs;
+	while (int(regs.size()) * 8 < size) {
+		if (!insn.Next() || !insn.Is(ARM_INS_VSTMIA, 3) || !insn.detail().writeback)
+			return nullptr;
+		if (!isReg(insn.op(0), ARM_REG_R12))
+			return nullptr;
+		for (int j = 1; j <= 2; ++j) {
+			const auto reg = insn.op(j).reg;
+			if (insn.op(j).type != ARM_OP_REG || reg < ARM_REG_D0 || reg > ARM_REG_D31)
+				return nullptr;
+			Reg value{static_cast<arm_reg>(reg)};
+			if (std::find(regs.begin(), regs.end(), value) != regs.end())
+				return nullptr;
+			regs.push_back(value);
+		}
+	}
+	auto call = insn;
+	if (!call.Next())
+		return nullptr;
+	const auto cpu = stackRegisters(*call.Current(), false);
+	if (!cpu.empty() && !call.Next())
+		return nullptr;
+	if (!call.Is(ARM_INS_BL, 1) || call.op(0).type != ARM_OP_IMM)
+		return nullptr;
+	auto* fn = app.FindFunctionExact(uint32_t(call.op(0).imm));
+	if (!fn || !fn->IsStub() || !call.Next())
+		return nullptr;
+	// Allocation slow paths can copy R0 out before restoring the saved CPU
+	// set. The copy does not affect SP or the values being restored.
+	if (call.Is(ARM_INS_MOV, 2) && call.op(0).type == ARM_OP_REG) {
+		Reg destination{static_cast<arm_reg>(call.op(0).reg)};
+		if (!destination.IsSet() || destination.IsDecimal() ||
+			!isReg(call.op(1), ToCapstoneReg(dart::CallingConventions::kReturnReg)))
+			return nullptr;
+		if (!(dart::kDartAvailableCpuRegs & (1 << int(destination))) ||
+			std::find(cpu.begin(), cpu.end(), destination) != cpu.end())
+			return nullptr;
+		if (!call.Next())
+			return nullptr;
+	}
+	if (!cpu.empty()) {
+		if (stackRegisters(*call.Current(), true) != cpu || !call.Next())
+			return nullptr;
+	}
+	const auto restore = call.Current()->address;
+	for (size_t j = 0; j < regs.size(); j += 2) {
+		if (!call.Is(ARM_INS_VPOP, 2))
+			return nullptr;
+		if (Reg{static_cast<arm_reg>(call.op(0).reg)} != regs[j])
+			return nullptr;
+		if (Reg{static_cast<arm_reg>(call.op(1).reg)} != regs[j + 1])
+			return nullptr;
+		if (j + 2 < regs.size() && !call.Next())
+			return nullptr;
+	}
+	fpuRestores.emplace(restore, SavedFpu{call.Range().end, regs});
+	return std::make_unique<SaveRegisterInstr>(insn.Range(), std::move(regs));
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadSavedRegisterInstr(InsnCursor& insn)
+{
+	const auto saved = fpuRestores.find(insn.Current()->address);
+	if (saved == fpuRestores.end())
+		return nullptr;
+	while (insn.Range().end < saved->second.end)
+		if (!insn.Next())
+			return nullptr;
+	return std::make_unique<RestoreRegisterInstr>(insn.Range(), saved->second.regs);
+}
+
+void FunctionAnalyzer::processSavedRegisters()
+{
+	// PushRegisters/PopRegisters around a stub. Equal register lists and an
+	// unchanged stack prove restoration; an ordinary argument push does not.
+	// A slow-path result copy can precede restoration, as in the FPU scope.
+	for (size_t i = 1; i + 1 < data.il_insns.size(); ++i) {
+		const auto& call = data.il_insns[i];
+		if (call->Kind() != ILInstr::Call)
+			continue;
+		auto* fn = static_cast<CallInstr&>(*call).GetFunction();
+		if (!fn || !fn->IsStub() || targets.contains(call->Start()))
+			continue;
+		auto& save = data.il_insns[i - 1];
+		if (save->Kind() != ILInstr::Unknown || save->End() != call->Start())
+			continue;
+		const auto* push = instructions.Ptr(data.asmTexts.AtIndex(save->Start()));
+		auto registers = stackRegisters(*push, false);
+		if (registers.empty())
+			continue;
+		size_t restoreIndex = i + 1;
+		uint64_t restoreStart = call->End();
+		if (data.il_insns[restoreIndex]->Kind() == ILInstr::MoveReg) {
+			const auto& move = static_cast<MoveRegInstr&>(*data.il_insns[restoreIndex]);
+			if (move.Start() != restoreStart || targets.contains(move.Start()))
+				continue;
+			if (move.srcReg != Reg{dart::CallingConventions::kReturnReg} || !move.dstReg.IsSet() ||
+				move.dstReg.IsDecimal())
+				continue;
+			if (!(dart::kDartAvailableCpuRegs & (1 << int(move.dstReg))) ||
+				std::find(registers.begin(), registers.end(), move.dstReg) != registers.end())
+				continue;
+			restoreStart = move.End();
+			if (++restoreIndex == data.il_insns.size())
+				continue;
+		}
+		auto& restore = data.il_insns[restoreIndex];
+		if (restore->Kind() != ILInstr::Unknown || restore->Start() != restoreStart ||
+			targets.contains(restoreStart))
+			continue;
+		const auto* pop = instructions.Ptr(data.asmTexts.AtIndex(restoreStart));
+		if (stackRegisters(*pop, true) != registers)
+			continue;
+		save = std::make_unique<SaveRegisterInstr>(save->Range(), registers);
+		restore = std::make_unique<RestoreRegisterInstr>(restore->Range(), std::move(registers));
+	}
+}
 
 const FunctionAnalyzer::Matcher FunctionAnalyzer::matchers[] = {
 	&FunctionAnalyzer::processEnterFrameInstr,
 	&FunctionAnalyzer::processLeaveFrameInstr,
+	&FunctionAnalyzer::processSaveRegisterInstr,
+	&FunctionAnalyzer::processLoadSavedRegisterInstr,
 	&FunctionAnalyzer::processAllocateStackInstr,
 	&FunctionAnalyzer::processCheckStackOverflowInstr,
+	&FunctionAnalyzer::processInitAsyncInstr,
+	&FunctionAnalyzer::processInlineTypeTestInstr,
+	&FunctionAnalyzer::processTypeTestInstr,
+	&FunctionAnalyzer::processTryAllocateObjectInstr,
 	&FunctionAnalyzer::processTailCallInstr,
+	&FunctionAnalyzer::processBoxInt64Instr,
+	&FunctionAnalyzer::processTaggedClassIdInstr,
+	&FunctionAnalyzer::processUnboxIntInstr,
+	&FunctionAnalyzer::processLoadClassIdInstr,
+	&FunctionAnalyzer::processBranchIfSmiInstr,
+	&FunctionAnalyzer::processClosureCallInstr,
+	&FunctionAnalyzer::processGdtCallInstr,
 	&FunctionAnalyzer::processPoolCallInstr,
+	&FunctionAnalyzer::processCallLeafRuntimeInstr,
 	&FunctionAnalyzer::processCallInstr,
 	&FunctionAnalyzer::processObjectPoolInstr,
 	&FunctionAnalyzer::processReturnInstr,
@@ -691,6 +1452,8 @@ void FunctionAnalyzer::emit(std::unique_ptr<ILInstr> il, size_t start, size_t en
 	} else if (il->Kind() == ILInstr::UnboxInt) {
 		const auto& unbox = static_cast<UnboxIntInstr&>(*il);
 		nonObjects[unbox.dstReg] = true;
+		if (unbox.highReg.IsSet())
+			nonObjects[unbox.highReg] = true;
 	} else if (il->Kind() == ILInstr::Call) {
 		auto* fn = static_cast<CallInstr&>(*il).GetFunction();
 		if (fn && fn->ReturnType() != dart::kIllegalCid)
@@ -742,6 +1505,7 @@ void FunctionAnalyzer::asm2il()
 		emit(std::move(il), i, end);
 		i = end;
 	}
+	processSavedRegisters();
 }
 } // namespace
 

@@ -10,7 +10,7 @@
 #include <string_view>
 #include <vector>
 
-// ELF64 layouts: Dart SDK runtime/platform/elf.h. Build a virtual image,
+// ELF32/ELF64 layouts: Dart SDK runtime/platform/elf.h. Build a virtual image,
 // not a file mapping: PT_LOAD offsets can differ and BSS has no file bytes.
 namespace {
 void Require(bool ok, const char* message) {
@@ -38,30 +38,39 @@ LibAppInfo ElfHelper::MapLibAppSo(const char* path)
     std::ifstream input(path, std::ios::binary | std::ios::ate);
     Require(bool(input), "Cannot open input");
     const auto length = input.tellg();
-    Require(length >= 64, "Truncated header");
+    Require(length >= 52, "Truncated header");
     std::vector<uint8_t> bytes(static_cast<size_t>(length));
     input.seekg(0);
     Require(bool(input.read(reinterpret_cast<char*>(bytes.data()), length)), "Truncated input");
     const Reader file{bytes};
     Require(std::memcmp(bytes.data(), "\x7f" "ELF", 4) == 0, "Invalid magic");
-    Require(bytes[4] == 2 && bytes[5] == 1 && bytes[6] == 1, "Expected little-endian ELF64");
-    Require(file.U16(16) == 3 && file.U32(20) == 1 && file.U16(52) == 64, "Invalid shared-object header");
-#if defined(TARGET_ARCH_X64)
-    Require(file.U16(18) == 62, "Expected x64 target");
+    const bool is64 = bytes[4] == 2;
+    Require((is64 || bytes[4] == 1) && bytes[5] == 1 && bytes[6] == 1,
+            "Expected little-endian ELF32 or ELF64");
+#if defined(TARGET_ARCH_ARM)
+    Require(!is64 && file.U16(18) == 40, "Expected ARM ELF32 target");
+#elif defined(TARGET_ARCH_X64)
+    Require(is64 && file.U16(18) == 62, "Expected x64 ELF64 target");
 #else
-    Require(file.U16(18) == 183, "Expected ARM64 target");
+    Require(is64 && file.U16(18) == 183, "Expected ARM64 ELF64 target");
 #endif
-    const auto phoff = file.U64(32), shoff = file.U64(40);
-    const auto phnum = file.U16(56), shnum = file.U16(60);
-    Require(file.U16(54) == 56 && file.U16(58) == 64 && phnum != 0 && shnum != 0,
-            "Invalid program or section table");
-    file.Range(phoff, uint64_t(phnum) * 56);
-    file.Range(shoff, uint64_t(shnum) * 64);
+    const uint64_t headerSize = is64 ? 64 : 52, phSize = is64 ? 56 : 32, shSize = is64 ? 64 : 40;
+    const uint64_t symSize = is64 ? 24 : 16;
+    const auto word = [&](uint64_t at) { return is64 ? file.U64(at) : uint64_t(file.U32(at)); };
+    Require(file.U16(16) == 3 && file.U32(20) == 1 && file.U16(is64 ? 52 : 40) == headerSize,
+            "Invalid shared-object header");
+    const auto phoff = word(is64 ? 32 : 28), shoff = word(is64 ? 40 : 32);
+    const auto phnum = file.U16(is64 ? 56 : 44), shnum = file.U16(is64 ? 60 : 48);
+    Require(file.U16(is64 ? 54 : 42) == phSize && file.U16(is64 ? 58 : 46) == shSize &&
+            phnum != 0 && shnum != 0, "Invalid program or section table");
+    file.Range(phoff, uint64_t(phnum) * phSize);
+    file.Range(shoff, uint64_t(shnum) * shSize);
     std::vector<Segment> segments;
     for (uint32_t i = 0; i < phnum; ++i) {
-        const auto at = phoff + uint64_t(i) * 56;
+        const auto at = phoff + uint64_t(i) * phSize;
         if (file.U32(at) != 1) continue; // PT_LOAD
-        Segment s{file.U64(at + 16), file.U64(at + 8), file.U64(at + 32), file.U64(at + 40)};
+        Segment s{word(at + (is64 ? 16 : 8)), word(at + (is64 ? 8 : 4)),
+                  word(at + (is64 ? 32 : 16)), word(at + (is64 ? 40 : 20))};
         Require(s.fileSize <= s.size, "Segment file size exceeds memory size");
         file.Range(s.offset, s.fileSize);
         Require(s.address <= kMaxImageSize && s.size <= kMaxImageSize - s.address,
@@ -82,19 +91,19 @@ LibAppInfo ElfHelper::MapLibAppSo(const char* path)
     std::array<uint64_t, 4> addresses{};
     std::array<bool, 4> found{};
     for (uint32_t i = 0; i < shnum; ++i) {
-        const auto at = shoff + uint64_t(i) * 64;
+        const auto at = shoff + uint64_t(i) * shSize;
         if (file.U32(at + 4) != 11) continue; // SHT_DYNSYM
-        const auto offset = file.U64(at + 24), size = file.U64(at + 32);
-        const auto link = file.U32(at + 40);
-        Require(file.U64(at + 56) == 24 && size % 24 == 0 && link < shnum, "Invalid dynamic symbol table");
+        const auto offset = word(at + (is64 ? 24 : 16)), size = word(at + (is64 ? 32 : 20));
+        const auto link = file.U32(at + (is64 ? 40 : 24));
+        Require(word(at + (is64 ? 56 : 36)) == symSize && size % symSize == 0 && link < shnum, "Invalid dynamic symbol table");
         file.Range(offset, size);
-        const auto str = shoff + uint64_t(link) * 64;
+        const auto str = shoff + uint64_t(link) * shSize;
         Require(file.U32(str + 4) == 3, "Invalid linked string table");
-        const auto stringsOffset = file.U64(str + 24), stringsSize = file.U64(str + 32);
+        const auto stringsOffset = word(str + (is64 ? 24 : 16)), stringsSize = word(str + (is64 ? 32 : 20));
         file.Range(stringsOffset, stringsSize);
-        for (uint64_t index = 0; index < size / 24; ++index) {
-            const auto sym = offset + index * 24;
-            if (file.U16(sym + 6) == 0) continue; // SHN_UNDEF
+        for (uint64_t index = 0; index < size / symSize; ++index) {
+            const auto sym = offset + index * symSize;
+            if (file.U16(sym + (is64 ? 6 : 14)) == 0) continue; // SHN_UNDEF
             const auto nameOffset = file.U32(sym);
             Require(nameOffset < stringsSize, "Invalid symbol string offset");
             auto text = file.Range(stringsOffset + nameOffset, stringsSize - nameOffset);
@@ -105,7 +114,7 @@ LibAppInfo ElfHelper::MapLibAppSo(const char* path)
             if (match == names.end()) continue;
             const auto n = static_cast<size_t>(match - names.begin());
             Require(!found[n], "Duplicate snapshot symbol");
-            const auto address = file.U64(sym + 8);
+            const auto address = word(sym + (is64 ? 8 : 4));
             const uint64_t required = n % 2 == 0 ? 53 : 16;
             const auto segment = std::find_if(segments.begin(), segments.end(), [&](const auto& s) {
                 return address >= s.address && address - s.address <= s.fileSize && required <= s.fileSize - (address - s.address);
@@ -120,7 +129,7 @@ LibAppInfo ElfHelper::MapLibAppSo(const char* path)
                 auto flags = file.Range(data + 52, snapshotSize + 4 - 52);
                 Require(std::memchr(flags.data(), 0, flags.size()) != nullptr, "Unterminated snapshot flags");
             } else {
-                Require(file.U64(data) >= 16 && file.U64(data) <= remaining, "Invalid instruction image length");
+                Require(word(data) >= 16 && word(data) <= remaining, "Invalid instruction image length");
             }
             addresses[n] = address; found[n] = true;
         }

@@ -307,7 +307,7 @@ void DartApp::loadStubs(dart::ObjectStore* store)
 	ptr = store->member(); \
 	code = ptr; \
 	ep_addr = code.EntryPoint() - base(); \
-	stub = new DartStub(ptr, DartStub::name ## Stub, ep_addr, code.Size(), #name); \
+	stub = new DartStub(ptr, DartStub::name ## Stub, ep_addr, static_cast<intptr_t>(code.Size()), #name); \
 	ASSERT(!stubs.contains(ep_addr)); \
 	stubs[ep_addr] = stub;
 	OBJECT_STORE_STUB_CODE_LIST(DO);
@@ -330,7 +330,7 @@ void DartApp::loadStubs(dart::ObjectStore* store)
 			ASSERT(stubs[ep_addr]->Name() == #name); \
 		} \
 		else { \
-			stub = new DartStub(code.ptr(), DartStub::name ## VMStub, ep_addr, code.Size(), #name); \
+			stub = new DartStub(code.ptr(), DartStub::name ## VMStub, ep_addr, static_cast<intptr_t>(code.Size()), #name); \
 			stubs[ep_addr] = stub; \
 			auto it = functions.find(ep_addr); \
 			if (it != functions.end()) { \
@@ -414,7 +414,11 @@ void DartApp::findFunctionInHeap()
 			ASSERT(code.IsStubCode());
 			if (!stubs.contains(ep_offset)) {
 				//std::cout << std::format("unknown stub at: {:#x}, {}, size: {}\n", ep_offset, code.ToCString(), code.Size());
-				auto stub_size = code.Size();
+				const auto stub_size = static_cast<intptr_t>(code.Size());
+				if (stub_size <= 0) {
+					stubs[ep_offset] = new DartStub(code_ptr, DartStub::UnknownStub, ep_offset, stub_size, "Unknown");
+					continue;
+				}
 				DartStub* candidateStub = nullptr;
 				std::vector<DartStub*> candidateStubs;
 				for (auto const& [stubEp, stub] : stubs) {
@@ -462,7 +466,7 @@ void DartApp::findFunctionInHeap()
 				throw std::runtime_error("not allocate stub for user class");
 			}
 			const auto cid = (uint32_t)dart::Class::Cast(obj).id();
-			auto astub = new DartAllocateStub(code_ptr, ep_offset, code.Size(), cid, classes[cid]->name);
+			auto astub = new DartAllocateStub(code_ptr, ep_offset, static_cast<intptr_t>(code.Size()), cid, classes[cid]->name);
 			stubs[ep_offset] = astub;
 		}
 		else if (obj.IsAbstractType()) {
@@ -480,7 +484,7 @@ void DartApp::findFunctionInHeap()
 			if (stubs.contains(ep_offset))
 				throw std::runtime_error("duplitcate stub entry point");
 			auto dartType = typeDb->FindOrAdd(dart::AbstractType::Cast(obj).ptr());
-			auto tstub = new DartTypeStub(code_ptr, ep_offset, code.Size(), *dartType, dartType->ToString());
+			auto tstub = new DartTypeStub(code_ptr, ep_offset, static_cast<intptr_t>(code.Size()), *dartType, dartType->ToString());
 			stubs[ep_offset] = tstub;
 		}
 		else if (obj.IsFunction()) {

@@ -41,7 +41,7 @@ class DartLibInfo:
         if has_compressed_ptrs is None:
             # use same as flutter default configuration
             # TODO: old Dart version has no pointer compression
-            self.has_compressed_ptrs = os_name == 'android'
+            self.has_compressed_ptrs = os_name == 'android' and arch != 'arm'
         else:
             self.has_compressed_ptrs = has_compressed_ptrs
         self.lib_name = f'dartvm{version}_{os_name}_{arch}'

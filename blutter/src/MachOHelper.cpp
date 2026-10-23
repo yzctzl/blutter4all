@@ -111,6 +111,9 @@ bool MachOHelper::IsMachO(const char* path)
 
 LibAppInfo MachOHelper::MapLibApp(const char* path)
 {
+#if defined(TARGET_ARCH_ARM)
+	throw std::invalid_argument("ARM32 Mach-O snapshots are not supported");
+#endif
 	const auto bytes = ReadFile(path);
 	const auto file = SelectTarget(Reader{bytes});
 	Require(file.U32(0) == kMach64, "Expected little-endian Mach-O 64 or FAT32 universal container");

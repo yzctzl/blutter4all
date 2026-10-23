@@ -125,7 +125,7 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 		std::replace(name.begin(), name.end(), ',', '&');
 		std::replace(name.begin(), name.end(), ' ', '_');
 		of << std::format("idaapi.set_name({:#x}, \"{}_{:x}\")\n", ep, name.c_str(), ep);
-		if (stub->Size() == 0)
+		if (stub->Size() <= 0)
 			continue;
 		of << std::format("ida_funcs.add_func({:#x}, {:#x})\n", ep, ep + stub->Size());
 	}
@@ -262,7 +262,7 @@ void DartDumper::applyStruct4Ida(std::ostream& of)
 				if (dartFn->PayloadSize() == 0)
 					continue;
 
-				auto insns = disasmer.Disasm((uint8_t*)dartFn->PayloadAddress() + app.base(), dartFn->PayloadSize(), dartFn->Address());
+				auto insns = disasmer.Disasm((uint8_t*)dartFn->PayloadAddress() + app.base(), dartFn->PayloadSize(), dartFn->PayloadAddress());
 
 				for (uint32_t i = 0; i < insns.Count(); i++) {
 					auto insn = insns.At(i);
@@ -606,7 +606,7 @@ std::string DartDumper::ObjectToString(dart::Object& obj, bool simpleForm, bool 
 #endif
 	case dart::kTypeParametersCid:
 		// might be in a Type but not in Object Pool directly
-		return std::format("{} (ptr: {:#x})", obj.ToCString(), (uint64_t)obj.ptr());
+		return std::format("{} (ptr: {:#x})", obj.ToCString(), (uintptr_t)obj.ptr());
 	case dart::kFieldCid: {
 		const auto& field = dart::Field::Cast(obj);
 		return std::format("{} (offset: {:#x})", field.ToCString(), field.TargetOffset());

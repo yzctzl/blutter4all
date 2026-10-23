@@ -57,11 +57,16 @@ public:
 	FunctionKind Kind() const { return kind; }
 
 	uint64_t PayloadAddress() const { return payload_addr; }
-	uint64_t PayloadSize() const { return size; }
+	uint64_t PayloadSize() const { return size > 0 ? static_cast<uint64_t>(size) : 0; }
 	uint64_t MonomorphicAddress() const { return morphic_addr; }
 	bool HasMorphicCode() const { return morphic_addr != ep_addr; }
 
-	virtual int64_t Size() const { return size > 0 ? size - (ep_addr - payload_addr) : 0; }
+	virtual int64_t Size() const {
+		if (size <= 0 || ep_addr < payload_addr)
+			return 0;
+		const auto prefix = ep_addr - payload_addr;
+		return prefix < static_cast<uint64_t>(size) ? size - prefix : 0;
+	}
 	virtual std::string FullName() const;
 
 	DartFunction* GetOutermostFunction() const;

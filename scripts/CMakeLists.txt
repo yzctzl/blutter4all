@@ -2,12 +2,19 @@
 # this is CMakeLists.txt template file for building dart AOT VM
 cmake_minimum_required (VERSION 3.20)
 
+# ARM32 snapshot object layouts require a 32-bit host runtime.
+if (TARGET_ARCH STREQUAL "arm" AND CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux"
+    AND NOT CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
+    execute_process(COMMAND uname -m OUTPUT_VARIABLE host_cpu OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if (host_cpu MATCHES "^(x86_64|amd64|i.86)$")
+        set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -m32")
+        set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -m32")
+    endif()
+endif()
+
 project(dartvmVERSION_PLACE_HOLDER)
 if (${PROJECT_NAME} MATCHES "_PLACE_HOLDER")
 	message(FATAL_ERROR "Do NOT use this file directly")
-endif()
-if(${CMAKE_SIZEOF_VOID_P} STREQUAL 4)
-	message(FATAL_ERROR "Only 64-bit compiler here")
 endif()
 
 set(CMAKE_INSTALL_PREFIX "${PROJECT_SOURCE_DIR}/../../packages" CACHE PATH "" FORCE)
@@ -33,8 +40,16 @@ endif()
 if (NOT DEFINED TARGET_ARCH)
 	set(TARGET_ARCH "arm64")
 endif()
-if (NOT "${TARGET_ARCH}" MATCHES "^(arm64|x64)$")
-	message(FATAL_ERROR "Only arm64 or x64 architecture")
+if (NOT "${TARGET_ARCH}" MATCHES "^(arm64|x64|arm)$")
+	message(FATAL_ERROR "Only arm64, x64 or arm architecture")
+endif()
+
+if (TARGET_ARCH STREQUAL "arm")
+    if (NOT CMAKE_SIZEOF_VOID_P EQUAL 4 OR COMPRESSED_PTRS)
+        message(FATAL_ERROR "ARM snapshots require a 32-bit runtime without compressed pointers")
+    endif()
+elseif (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "ARM64/x64 snapshots require a 64-bit runtime")
 endif()
 
 set(SRCDIR "runtime")
@@ -71,9 +86,11 @@ elseif (${TARGET_OS} STREQUAL "windows")
 else()
 	set(target_os "DART_TARGET_OS_LINUX")
 endif()
-# TARGET_ARCH_ARM64 or TARGET_ARCH_X64
+# The target ABI is independent of the host instruction set.
 if (${TARGET_ARCH} STREQUAL "arm64")
 	set(target_arch "TARGET_ARCH_ARM64")
+elseif (TARGET_ARCH STREQUAL "arm")
+	set(target_arch "TARGET_ARCH_ARM")
 else()
 	set(target_arch "TARGET_ARCH_X64")
 endif()

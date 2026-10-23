@@ -1,11 +1,25 @@
 cmake_minimum_required (VERSION 3.20)
 
+# ARM32 snapshot object layouts require a 32-bit host runtime.
+if (DARTLIB MATCHES "_arm($|_)" AND CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux"
+    AND NOT CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
+    execute_process(COMMAND uname -m OUTPUT_VARIABLE host_cpu OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if (host_cpu MATCHES "^(x86_64|amd64|i.86)$")
+        set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -m32")
+        set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -m32")
+    endif()
+endif()
+
 project(blutter)
 if (NOT DEFINED DARTLIB)
 	message(FATAL_ERROR "Please define DARTLIB to build the Blutter project")
 endif()
 if (NOT ${DARTLIB} MATCHES "^dartvm")
 	message(FATAL_ERROR "DARTLIB name should start with 'dartvm'")
+endif()
+
+if (DARTLIB MATCHES "_arm($|_)" AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(FATAL_ERROR "ARM analysis requires a 32-bit toolchain and 32-bit Dart/Capstone/ICU libraries")
 endif()
 
 set(BINNAME "${PROJECT_NAME}_${DARTLIB}${NAME_SUFFIX}")
@@ -34,7 +48,7 @@ else()
 	include(FindPkgConfig)
 	pkg_search_module(CAPSTONE REQUIRED capstone)
 	link_directories(${CAPSTONE_LIBDIR})
-	include_directories(AFTER ${CAPSTONE_INCLUDEDIR})
+	include_directories(AFTER ${CAPSTONE_INCLUDE_DIRS})
 endif()
 
 # Add source to this project's executable.

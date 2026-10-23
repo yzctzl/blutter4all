@@ -72,11 +72,13 @@ DartFunction::DartFunction(DartClass& cls, const dart::FunctionPtr ptr) : DartFn
 	const auto& code = dart::Code::Handle(zone, func.CurrentCode());
 	payload_addr = code.PayloadStart();
 	if (payload_addr > 0)
-		payload_addr -= lib_base;
+		payload_addr -= static_cast<uintptr_t>(lib_base);
 	morphic_addr = code.MonomorphicEntryPoint();
 	if (morphic_addr > 0)
-		morphic_addr -= lib_base;
-	size = code.Size();
+		morphic_addr -= static_cast<uintptr_t>(lib_base);
+	// Code::Size uses target-word -1 when the AOT body was discarded.
+	// Sign-extend before storing it in the architecture-independent length.
+	size = static_cast<intptr_t>(code.Size());
 	ep_addr = code.EntryPoint() - lib_base;
 	if (ep != ep_addr) {
 		ep_addr = ep;
@@ -116,11 +118,13 @@ DartFunction::DartFunction(DartClass& cls, const dart::Code& code)
 {
 	payload_addr = code.PayloadStart();
 	if (payload_addr > 0)
-		payload_addr -= lib_base;
+		payload_addr -= static_cast<uintptr_t>(lib_base);
 	morphic_addr = code.MonomorphicEntryPoint();
 	if (morphic_addr > 0)
-		morphic_addr -= lib_base;
-	size = code.Size();
+		morphic_addr -= static_cast<uintptr_t>(lib_base);
+	// Code::Size uses target-word -1 when the AOT body was discarded.
+	// Sign-extend before storing it in the architecture-independent length.
+	size = static_cast<intptr_t>(code.Size());
 	ep_addr = code.EntryPoint() - lib_base;
 	name = "__unknown_function__";
 }

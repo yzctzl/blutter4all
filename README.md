@@ -140,8 +140,9 @@ The ARM backend uses the SDK's ARM ABI and A32 instructions. It recognizes
 frames, stack checks, object pools, constants, direct and indirect calls,
 register moves, returns, class IDs, integer boxing/unboxing, fixed-size inline
 allocation, type-test stubs, async initialization, runtime/closure/dispatch calls,
-and paired CPU/FPU register preservation scopes. Unrecognized instructions retain their original
-assembly.
+and paired CPU/FPU register preservation scopes. Selected field/list/typed-data accesses, write barriers, static fields, and
+late initialization are recognized too. Unrecognized instructions retain their
+original assembly.
 
 ARM snapshots require a **32-bit Blutter and Dart runtime**, without pointer
 compression. On Linux x86 hosts CMake selects `-m32`; a multilib C++ toolchain

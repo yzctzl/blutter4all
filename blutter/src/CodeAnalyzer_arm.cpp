@@ -256,6 +256,7 @@ class FunctionAnalyzer
 	std::unique_ptr<ILInstr> processObjectPoolInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processLoadClassIdInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processBranchIfSmiInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processLoadFieldTableInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processCallInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processPoolCallInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processCallLeafRuntimeInstr(InsnCursor& insn);
@@ -263,9 +264,11 @@ class FunctionAnalyzer
 	std::unique_ptr<ILInstr> processClosureCallInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processUnboxIntInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processInitAsyncInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processInitLateStaticFieldInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processTypeTestInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processInlineTypeTestInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processTryAllocateObjectInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processWriteBarrierInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processTailCallInstr(InsnCursor& insn);
 	LoadValueInstr* previousLoad(const InsnCursor& insn);
 	std::unique_ptr<ILInstr> processBoxInt64Instr(InsnCursor& insn);
@@ -276,8 +279,10 @@ class FunctionAnalyzer
 	std::unique_ptr<ILInstr> processReturnInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processMoveRegInstr(InsnCursor& insn);
 	std::unique_ptr<ILInstr> processLoadValueInstr(InsnCursor& insn);
+	std::unique_ptr<ILInstr> processLoadStore(InsnCursor& insn);
 	std::unique_ptr<ILInstr> poolLoad(InsnCursor& insn, int64_t displacement, Reg dst, bool store = false);
 	std::unique_ptr<ILInstr> processPoolAccess(InsnCursor& insn, bool store);
+	std::unique_ptr<ILInstr> processStorePoolInstr(InsnCursor& insn);
 	void emit(std::unique_ptr<ILInstr> il, size_t start, size_t end);
 	using Matcher = std::unique_ptr<ILInstr> (FunctionAnalyzer::*)(InsnCursor&);
 	static const Matcher matchers[];
@@ -409,6 +414,11 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processObjectPoolInstr(InsnCursor& in
 	return processPoolAccess(insn, false);
 }
 
+std::unique_ptr<ILInstr> FunctionAnalyzer::processStorePoolInstr(InsnCursor& insn)
+{
+	return processPoolAccess(insn, true);
+}
+
 std::unique_ptr<ILInstr> FunctionAnalyzer::processPoolAccess(InsnCursor& insn, bool store)
 {
 	// LoadWordFromPoolIndex: ldr [pp, lo], or add dst, pp, hi; ldr [dst, lo].
@@ -489,6 +499,49 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processBranchIfSmiInstr(InsnCursor& i
 	if (!insn.Next() || !insn.Is(ARM_INS_B, 1, ARM_CC_EQ) || insn.op(0).type != ARM_OP_IMM)
 		return nullptr;
 	return std::make_unique<BranchIfSmiInstr>(insn.Range(), Reg{object}, uint32_t(insn.op(0).imm));
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadFieldTableInstr(InsnCursor& insn)
+{
+	// il_arm.cc LoadStaticField / StoreStaticField: thread's field table, then
+	// a native word offset. Do not confuse it with a tagged heap field access.
+	auto table = readMemory(insn);
+	if (table && table->size == dart::kWordSize) {
+		Reg base{table->base};
+		if (base.IsSet() && fieldTables[base]) {
+			const auto offset = *fieldTables[base] + table->offset;
+			if (offset < 0 || offset > UINT32_MAX || offset % dart::kWordSize)
+				return nullptr;
+			if (table->load)
+				return std::make_unique<LoadStaticFieldInstr>(insn.Range(), table->value, offset);
+			return std::make_unique<StoreStaticFieldInstr>(insn.Range(), table->value, offset);
+		}
+	}
+	if (!table || !table->load || table->base != CSREG_DART_THR || table->size != 4)
+		return nullptr;
+	if (table->offset != AOT_Thread_field_table_values_offset)
+		return nullptr;
+	auto base = insn.op(0).reg;
+	if (!insn.Next())
+		return nullptr;
+	int64_t high = 0;
+	if (insn.Is(ARM_INS_ADD, 3) && isReg(insn.op(1), base) && insn.op(2).type == ARM_OP_IMM) {
+		if (insn.op(0).type != ARM_OP_REG || insn.detail().update_flags)
+			return nullptr;
+		base = insn.op(0).reg;
+		high = insn.op(2).imm;
+		if (!insn.Next())
+			return nullptr;
+	}
+	auto memory = readMemory(insn);
+	if (!memory || memory->base != base || memory->size != 4)
+		return nullptr;
+	const auto offset = high + memory->offset;
+	if (offset < 0 || offset > UINT32_MAX || offset % 4)
+		return nullptr;
+	if (memory->load)
+		return std::make_unique<LoadStaticFieldInstr>(insn.Range(), memory->value, offset);
+	return std::make_unique<StoreStaticFieldInstr>(insn.Range(), memory->value, offset);
 }
 
 std::unique_ptr<ILInstr> FunctionAnalyzer::processCallInstr(InsnCursor& insn)
@@ -657,6 +710,170 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadValueInstr(InsnCursor& ins
 	return std::make_unique<LoadValueInstr>(insn.Range(),
 		Reg{dst},
 		VarItem{VarStorage::NewImmediate(), new VarInteger(int32_t(*value), VarValue::NativeInt)});
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(InsnCursor& insn)
+{
+	// ElementAddressForRegIndex and LoadFieldFromOffset both form an address
+	// before accessing it. Fold only the proven address expression, with no
+	// writeback or intervening branch entry.
+	int64_t adjustment = 0;
+	arm_reg object = ARM_REG_INVALID, address = ARM_REG_INVALID, index = ARM_REG_INVALID;
+	arm_shifter shift = ARM_SFT_INVALID;
+	unsigned scale = 0;
+	if (insn.Is(ARM_INS_ADD, 3) && insn.op(0).type == ARM_OP_REG && insn.op(1).type == ARM_OP_REG) {
+		if (insn.detail().update_flags)
+			return nullptr;
+		address = static_cast<arm_reg>(insn.op(0).reg);
+		object = static_cast<arm_reg>(insn.op(1).reg);
+		if (insn.op(2).type == ARM_OP_IMM)
+			adjustment = insn.op(2).imm;
+		else if (insn.op(2).type == ARM_OP_REG) {
+			index = static_cast<arm_reg>(insn.op(2).reg);
+			shift = insn.op(2).shift.type;
+			scale = insn.op(2).shift.value;
+		} else
+			return nullptr;
+		if (!insn.Next())
+			return nullptr;
+		// VFP and mode-3 stores cannot encode a tagged data displacement.
+		// ElementAddressForRegIndex adds its high part to the temporary first.
+		if (insn.Is(ARM_INS_ADD, 3) && isReg(insn.op(0), address) && isReg(insn.op(1), address)) {
+			if (insn.op(2).type != ARM_OP_IMM || insn.detail().update_flags)
+				return nullptr;
+			adjustment += insn.op(2).imm;
+			if (!insn.Next())
+				return nullptr;
+		}
+	}
+	auto memory = readMemory(insn, true);
+	if (!memory)
+		return nullptr;
+	if (address != ARM_REG_INVALID && memory->base != address)
+		return nullptr;
+	if (insn.op(1).mem.index != ARM_REG_INVALID) {
+		if (index != ARM_REG_INVALID)
+			return nullptr;
+		index = insn.op(1).mem.index;
+		shift = insn.op(1).shift.type;
+		scale = insn.op(1).shift.value;
+	}
+	Reg base{object == ARM_REG_INVALID ? memory->base : object};
+	if (!base.IsSet() || base.IsDecimal() || base == Reg{dart::PP} || base == Reg{dart::THR})
+		return nullptr;
+	if (base == Reg{dart::SPREG} || base == Reg{dart::FPREG} || base == Reg{dart::PC})
+		return nullptr;
+	if (nonObjects[base])
+		return nullptr;
+	const int64_t offset = adjustment + memory->offset + dart::kHeapObjectTag;
+	if (index != ARM_REG_INVALID) {
+		// A word list's tagged index is shifted once. Other element kinds need
+		// an exact internal receiver layout; raw/external backing pointers do not
+		// establish a Dart array operation.
+		const auto* receiver = objects[base];
+		ArrayOp::ArrayType arrayType;
+		if (receiver && receiver->Id() == dart::kImmutableArrayCid && !memory->load)
+			return nullptr;
+		if (receiver && dart::IsTypedDataClassId(receiver->Id())) {
+			if (offset != dart::Instance::DataOffsetFor(receiver->Id()) ||
+				memory->size != dart::TypedDataBase::ElementSizeInBytes(receiver->Id()))
+				return nullptr;
+			arrayType = ArrayOp::TypedUnknown;
+		} else {
+			if (receiver && receiver->Id() != dart::kArrayCid && receiver->Id() != dart::kImmutableArrayCid)
+				return nullptr;
+			if (offset != dart::Array::data_offset())
+				return nullptr;
+			if (memory->size != dart::kWordSize || memory->value.IsDecimal())
+				return nullptr;
+			arrayType = ArrayOp::List;
+		}
+
+		// A tagged index contributes one bit of scale. A byte element instead
+		// needs ASR #1; larger elements use LSL #(log2(size) - tag size).
+		const unsigned expected = ArrayOp{memory->size, memory->load, ArrayOp::Unknown}.SizeLog2();
+		const bool unboxed = receiver && scale == expected &&
+							 (shift == ARM_SFT_LSL || (scale == 0 && shift == ARM_SFT_INVALID));
+		if (!unboxed && expected == 0) {
+			if (shift != ARM_SFT_ASR || scale != 1)
+				return nullptr;
+		} else if (!unboxed) {
+			if (scale != expected - 1)
+				return nullptr;
+			if (shift != ARM_SFT_LSL && !(scale == 0 && shift == ARM_SFT_INVALID))
+				return nullptr;
+		}
+		ArrayOp operation{memory->size, memory->load, arrayType};
+		operation.inferred = !objects[base];
+		operation.indexUnboxed = unboxed;
+		if (memory->load)
+			return std::make_unique<LoadArrayElementInstr>(
+				insn.Range(), memory->value, base, VarStorage{Reg{index}}, operation);
+		return std::make_unique<StoreArrayElementInstr>(
+			insn.Range(), memory->value, base, VarStorage{Reg{index}}, operation);
+	}
+	// Constant indices need a receiver layout (or the array barrier below).
+	// Do not reinterpret arbitrary small fields as array elements.
+	if (const auto* receiver = objects[base]) {
+		const bool list = receiver->Id() == dart::kArrayCid || receiver->Id() == dart::kImmutableArrayCid;
+		const bool typed = dart::IsTypedDataClassId(receiver->Id());
+		if (list || typed) {
+			const auto size =
+				list ? dart::kWordSize : dart::TypedDataBase::ElementSizeInBytes(receiver->Id());
+			const auto payload = offset - dart::Instance::DataOffsetFor(receiver->Id());
+			if (payload >= 0 && payload % size == 0 && memory->size == size) {
+				if (!memory->load && receiver->Id() == dart::kImmutableArrayCid)
+					return nullptr;
+				ArrayOp operation{memory->size, memory->load, list ? ArrayOp::List : ArrayOp::TypedUnknown};
+				auto element = VarStorage::NewSmallImm(payload / size);
+				if (memory->load)
+					return std::make_unique<LoadArrayElementInstr>(
+						insn.Range(), memory->value, base, element, operation);
+				return std::make_unique<StoreArrayElementInstr>(
+					insn.Range(), memory->value, base, element, operation);
+			}
+		}
+	}
+	// StoreIndexed computes the exact slot in kWriteBarrierSlotReg before
+	// ArrayStoreBarrier. The verified barrier establishes the receiver kind;
+	// a payload-looking offset by itself does not. Leave the barrier separate.
+	if (!memory->load && memory->size == dart::kWordSize && !memory->value.IsDecimal()) {
+		const bool slot = address == ToCapstoneReg(dart::kWriteBarrierSlotReg) && memory->offset == 0;
+		const auto payload = offset - dart::Array::data_offset();
+		if (slot && payload >= 0 && payload % dart::kWordSize == 0) {
+			auto next = insn;
+			auto barrier = next.Next() ? processWriteBarrierInstr(next) : nullptr;
+			if (barrier) {
+				const auto& write = static_cast<WriteBarrierInstr&>(*barrier);
+				if (write.isArray && write.objReg == base && write.valReg == memory->value) {
+					ArrayOp operation{dart::kWordSize, false, ArrayOp::List};
+					return std::make_unique<StoreArrayElementInstr>(insn.Range(),
+						memory->value,
+						base,
+						VarStorage::NewSmallImm(payload / dart::kWordSize),
+						operation);
+				}
+			}
+		}
+	}
+	if (offset < dart::kWordSize || offset > UINT32_MAX || offset % dart::kWordSize)
+		return nullptr;
+	// A tagged-address shape is weaker evidence than a receiver layout. Keep
+	// this distinction in the IL, as on x64; byte/raw pointer loads stay unknown.
+	if (memory->size != 4 && memory->size != 8)
+		return nullptr;
+	if (memory->size == 8 && !memory->value.IsDecimal())
+		return nullptr;
+	if (memory->load) {
+		auto il = std::make_unique<LoadFieldInstr>(
+			insn.Range(), memory->value, base, offset, FieldAccessEvidence::TaggedAddress);
+		il->accessSize = memory->size;
+		return il;
+	}
+	auto il = std::make_unique<StoreFieldInstr>(
+		insn.Range(), memory->value, base, offset, FieldAccessEvidence::TaggedAddress);
+	il->accessSize = memory->size;
+	return il;
 }
 
 std::unique_ptr<ILInstr> FunctionAnalyzer::processGdtCallInstr(InsnCursor& insn)
@@ -828,6 +1045,44 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processInitAsyncInstr(InsnCursor& ins
 	data.returnType = type;
 	data.RemoveLastIL();
 	return std::make_unique<InitAsyncInstr>(AddrRange{start, insn.Range().end}, type);
+#else
+	return nullptr;
+#endif
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processInitLateStaticFieldInstr(InsnCursor& insn)
+{
+#ifndef NO_INIT_LATE_STATIC_FIELD
+	// il.cc LoadStaticField: sentinel test stays separate; only the exact
+	// initializer stub and its Field pool argument establish this operation.
+	if (!insn.Is(ARM_INS_BL, 1) || insn.op(0).type != ARM_OP_IMM)
+		return nullptr;
+	auto* fn = app.FindFunctionExact(uint32_t(insn.op(0).imm));
+	if (!fn || !fn->IsStub())
+		return nullptr;
+	const auto kind = fn->AsStub()->kind;
+	if (kind != DartStub::InitLateStaticFieldStub && kind != DartStub::InitLateFinalStaticFieldStub)
+		return nullptr;
+	auto* load = previousLoad(insn);
+	if (!load || load->dstReg != Reg{dart::InitStaticFieldABI::kFieldReg})
+		return nullptr;
+	if (load->val.storage.kind != VarStorage::Pool)
+		return nullptr;
+	const auto index = PoolIndexFromOffset(load->val.storage.offset);
+	const auto& pool = app.GetObjectPool();
+	if (pool.TypeAt(index) != dart::ObjectPool::EntryType::kTaggedObject)
+		return nullptr;
+	const auto& object = dart::Object::Handle(pool.ObjectAt(index));
+	if (!object.IsField())
+		return nullptr;
+	const auto& field = dart::Field::Cast(object);
+	auto* info = app.FindStaticField(field.TargetOffset());
+	if (!field.is_static() || !info)
+		return nullptr;
+	const auto start = load->Start();
+	data.RemoveLastIL();
+	return std::make_unique<InitLateStaticFieldInstr>(
+		AddrRange{start, insn.Range().end}, VarStorage{Reg{dart::InitStaticFieldABI::kResultReg}}, *info);
 #else
 	return nullptr;
 #endif
@@ -1035,6 +1290,132 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processTryAllocateObjectInstr(InsnCur
 	if (layout <= 0 || ((layout + dart::kObjectAlignment - 1) & -dart::kObjectAlignment) != size)
 		return nullptr;
 	return std::make_unique<AllocateObjectInstr>(insn.Range(), top->value, *cls);
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processWriteBarrierInstr(InsnCursor& insn)
+{
+	// StoreBarrier / ArrayStoreBarrier: conditional LDRNE+BLXNE on ARM,
+	// not ARM64's branch around an unconditional call. LR may be spilled.
+	arm_reg value = ARM_REG_INVALID;
+	uint32_t done = 0;
+	if (insn.Is(ARM_INS_TST, 2) && isImm(insn.op(1), dart::kSmiTagMask)) {
+		if (insn.op(0).type != ARM_OP_REG)
+			return nullptr;
+		value = static_cast<arm_reg>(insn.op(0).reg);
+		if (!insn.Next() || !insn.Is(ARM_INS_B, 1, ARM_CC_EQ) || insn.op(0).type != ARM_OP_IMM)
+			return nullptr;
+		done = uint32_t(insn.op(0).imm);
+		if (!insn.Next())
+			return nullptr;
+	}
+
+	// Optional LR spill, followed by object/value tag-byte loads.
+	const bool spill = singleStackRegister(*insn.Current(), false) == Reg{dart::R14};
+	if (spill && !insn.Next())
+		return nullptr;
+	if (!insn.Is(ARM_INS_LDRB, 2) || !isMemory(insn.op(1), insn.op(1).mem.base))
+		return nullptr;
+	if (insn.detail().writeback || insn.op(1).mem.disp != -dart::kHeapObjectTag)
+		return nullptr;
+	const auto object = static_cast<arm_reg>(insn.op(1).mem.base);
+	const auto scratch = insn.op(0).reg;
+	if (!insn.Next() || !insn.Is(ARM_INS_LDRB, 2) || !isReg(insn.op(0), ARM_REG_LR))
+		return nullptr;
+	if (!isMemory(insn.op(1), insn.op(1).mem.base) || insn.detail().writeback ||
+		insn.op(1).mem.disp != -dart::kHeapObjectTag)
+		return nullptr;
+	if (value != ARM_REG_INVALID && value != insn.op(1).mem.base)
+		return nullptr;
+	value = static_cast<arm_reg>(insn.op(1).mem.base);
+	if (object == ARM_REG_LR || object == value || scratch == object || scratch == value ||
+		scratch == ARM_REG_LR)
+		return nullptr;
+	if (value != ToCapstoneReg(dart::kWriteBarrierValueReg))
+		return nullptr;
+
+	// and scratch, lr, scratch, lsr #overlap; ldr lr, [thr, #mask]; tst scratch, lr
+	if (!insn.Next() || !insn.Is(ARM_INS_AND, 3) || insn.detail().update_flags)
+		return nullptr;
+	if (!isReg(insn.op(0), scratch) || !isReg(insn.op(1), ARM_REG_LR) || insn.op(2).type != ARM_OP_REG ||
+		insn.op(2).reg != scratch)
+		return nullptr;
+	if (insn.op(2).shift.type != ARM_SFT_LSR ||
+		insn.op(2).shift.value != dart::UntaggedObject::kBarrierOverlapShift)
+		return nullptr;
+	if (!insn.Next())
+		return nullptr;
+	const auto mask = readMemory(insn);
+	if (!mask || !mask->load || mask->size != dart::kWordSize)
+		return nullptr;
+	if (mask->base != CSREG_DART_THR || mask->value != Reg{dart::R14})
+		return nullptr;
+	if (mask->offset != AOT_Thread_write_barrier_mask_offset)
+		return nullptr;
+	if (!insn.Next() || !insn.Is(ARM_INS_TST, 2))
+		return nullptr;
+	if (!isReg(insn.op(0), scratch) || !isReg(insn.op(1), ARM_REG_LR))
+		return nullptr;
+	if (!insn.Next())
+		return nullptr;
+
+	// The NE call must reach the array stub or the wrapper for this object
+	// register. A matching stub family alone does not prove the correct entry.
+	bool array = false;
+	if (insn.Is(ARM_INS_BL, 1, ARM_CC_NE) && insn.op(0).type == ARM_OP_IMM) {
+		// AOT relocation can replace the THR load/call with a direct BLNE.
+		const auto target = uint32_t(insn.op(0).imm);
+		auto* fn = app.GetFunction(target);
+		if (!fn || !fn->IsStub())
+			return nullptr;
+		const auto kind = fn->AsStub()->kind;
+		// GetFunction may split a stub at a referenced entry. Use the original
+		// VM Code entry, not the address of that mutable split, as the origin.
+		const auto& code = dart::Code::Handle(fn->AsStub()->ptr);
+		if (code.IsNull())
+			return nullptr;
+		const auto origin = uint32_t(code.EntryPoint() - uintptr_t(app.base()));
+		array = kind == DartStub::ArrayWriteBarrierStub;
+		if (array) {
+			if (target != origin)
+				return nullptr;
+		} else {
+			if (kind != DartStub::WriteBarrierWrappersStub)
+				return nullptr;
+			const auto reg = static_cast<dart::Register>(int(Reg{object}));
+			if (!(dart::kDartAvailableCpuRegs & (1 << reg)))
+				return nullptr;
+			const auto offset = dart::Thread::WriteBarrierWrappersOffsetForRegister(reg);
+			if (target != origin + offset)
+				return nullptr;
+		}
+	} else {
+		if (!insn.Is(ARM_INS_LDR, 2, ARM_CC_NE) || !isReg(insn.op(0), ARM_REG_LR))
+			return nullptr;
+		if (!isMemory(insn.op(1), CSREG_DART_THR) || insn.detail().writeback)
+			return nullptr;
+		const auto entry = insn.op(1).mem.disp;
+		array = entry == AOT_Thread_array_write_barrier_entry_point_offset;
+		if (!array) {
+			const auto reg = static_cast<dart::Register>(int(Reg{object}));
+			if (!(dart::kDartAvailableCpuRegs & (1 << reg)))
+				return nullptr;
+			if (entry != dart::Thread::write_barrier_wrappers_thread_offset(reg))
+				return nullptr;
+		}
+		if (!insn.Next() || !insn.Is(ARM_INS_BLX, 1, ARM_CC_NE) || !isReg(insn.op(0), ARM_REG_LR))
+			return nullptr;
+	}
+
+	// Restore spilled LR and prove the optional Smi branch rejoins after it.
+	if (array && object != ToCapstoneReg(dart::kWriteBarrierObjectReg))
+		return nullptr;
+	if (spill) {
+		if (!insn.Next() || singleStackRegister(*insn.Current(), true) != Reg{dart::R14})
+			return nullptr;
+	}
+	if (done && done != insn.Range().end)
+		return nullptr;
+	return std::make_unique<WriteBarrierInstr>(insn.Range(), Reg{object}, Reg{value}, array);
 }
 
 std::unique_ptr<ILInstr> FunctionAnalyzer::processTailCallInstr(InsnCursor& insn)
@@ -1325,24 +1706,29 @@ const FunctionAnalyzer::Matcher FunctionAnalyzer::matchers[] = {
 	&FunctionAnalyzer::processAllocateStackInstr,
 	&FunctionAnalyzer::processCheckStackOverflowInstr,
 	&FunctionAnalyzer::processInitAsyncInstr,
+	&FunctionAnalyzer::processInitLateStaticFieldInstr,
 	&FunctionAnalyzer::processInlineTypeTestInstr,
 	&FunctionAnalyzer::processTypeTestInstr,
 	&FunctionAnalyzer::processTryAllocateObjectInstr,
+	&FunctionAnalyzer::processWriteBarrierInstr,
 	&FunctionAnalyzer::processTailCallInstr,
 	&FunctionAnalyzer::processBoxInt64Instr,
 	&FunctionAnalyzer::processTaggedClassIdInstr,
 	&FunctionAnalyzer::processUnboxIntInstr,
 	&FunctionAnalyzer::processLoadClassIdInstr,
 	&FunctionAnalyzer::processBranchIfSmiInstr,
+	&FunctionAnalyzer::processLoadFieldTableInstr,
 	&FunctionAnalyzer::processClosureCallInstr,
 	&FunctionAnalyzer::processGdtCallInstr,
 	&FunctionAnalyzer::processPoolCallInstr,
 	&FunctionAnalyzer::processCallLeafRuntimeInstr,
 	&FunctionAnalyzer::processCallInstr,
 	&FunctionAnalyzer::processObjectPoolInstr,
+	&FunctionAnalyzer::processStorePoolInstr,
 	&FunctionAnalyzer::processReturnInstr,
 	&FunctionAnalyzer::processMoveRegInstr,
 	&FunctionAnalyzer::processLoadValueInstr,
+	&FunctionAnalyzer::processLoadStore,
 };
 
 void FunctionAnalyzer::emit(std::unique_ptr<ILInstr> il, size_t start, size_t end)

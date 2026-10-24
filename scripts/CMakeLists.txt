@@ -58,10 +58,22 @@ if (NOT COMPRESSED_PTRS)
 	string(APPEND LIBNAME "_no-compressed-ptrs")
 endif()
 
+if (SNAPSHOT_HASH)
+	string(LENGTH "${SNAPSHOT_HASH}" snapshot_hash_length)
+	if (NOT snapshot_hash_length EQUAL 32 OR NOT SNAPSHOT_HASH MATCHES "^[0-9a-f]+$")
+		message(FATAL_ERROR "Invalid Dart snapshot hash")
+	endif()
+	string(APPEND LIBNAME "_snapshot-${SNAPSHOT_HASH}")
+endif()
+
 set(CMAKE_DEBUG_POSTFIX "_d")
 
 # Add source to this project's executable.
 include(sourcelist.cmake)
+if (VERSION_FILE)
+	list(FILTER SRCS EXCLUDE REGEX "(^|/)vm/version\\.cc$")
+	list(APPEND SRCS "${VERSION_FILE}")
+endif()
 add_library(${LIBNAME} STATIC ${SRCS})
 
 set_target_properties(${LIBNAME} PROPERTIES
@@ -111,9 +123,9 @@ set(defines ${target_arch} ${target_os}
 
 if (MSVC)
 	# remove compiler exception handler options
-	string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
+	string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 	# remove compiler RTTI option
-	string(REPLACE "/GR" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
+	string(REPLACE "/GR" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 	set(cc_opts
 		/Oy /GR- /EHs-c-
 	)

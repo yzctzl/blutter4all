@@ -49,6 +49,8 @@ static std::string getFunctionName4Ida(const DartFunction& dartFn, const std::st
 	if (OP_MAP.contains(fnName)) {
 		return prefix + "op_" + OP_MAP[fnName];
 	}
+	if (fnName.empty())
+		return std::format("function_{:x}", dartFn.Address());
 	const auto last = fnName.back();
 	if (last == '=') {
 		fnName.pop_back();
@@ -67,7 +69,7 @@ static std::string getFunctionName4Ida(const DartFunction& dartFn, const std::st
 	case DartFunction::CONSTRUCTOR: {
 		std::string name = dartFn.IsStatic() ? "factory_ctor" : "ctor";
 		ASSERT(fnName.starts_with(cls_prefix));
-		if (fnName[cls_prefix.length()] == '.') {
+		if (fnName.size() > cls_prefix.length() && fnName[cls_prefix.length()] == '.') {
 			name += '_';
 			name += &fnName[cls_prefix.length() + 1];
 		}
@@ -88,97 +90,109 @@ static std::string getFunctionName4Ida(const DartFunction& dartFn, const std::st
 // Export facts once. Tool APIs and source-language escaping live in Python/templates.
 void DartDumper::DumpScriptData(const std::filesystem::path& filename)
 {
-	std::ofstream of(filename);
-	of.exceptions(std::ios::badbit | std::ios::failbit);
-	of << "{\"schema\":1,\"dart\":" << Util::JsonQuote(Dart_VersionString()) << ",\"target\":{";
+	auto temporary = filename;
+	temporary += ".tmp";
+	std::filesystem::remove(filename);
+	try {
+		std::ofstream of(temporary);
+		of.exceptions(std::ios::badbit | std::ios::failbit);
+		of << "{\"schema\":1,\"dart\":" << Util::JsonQuote(Dart_VersionString()) << ",\"target\":{";
 #if defined(TARGET_ARCH_ARM64)
-	of << "\"arch\":\"arm64\",";
+		of << "\"arch\":\"arm64\",";
 #elif defined(TARGET_ARCH_X64)
-	of << "\"arch\":\"x64\",";
+		of << "\"arch\":\"x64\",";
 #else
-	of << "\"arch\":\"arm\",";
+		of << "\"arch\":\"arm\",";
 #endif
-	Disassembler disassembler;
+		Disassembler disassembler;
 #if defined(TARGET_ARCH_ARM)
-	// Frida exposes r10, not Capstone's optional ARM alias "sl".
-	of << "\"thread\":" << Util::JsonQuote(std::format("r{}", static_cast<int>(dart::THR)))
-		<< ",\"pool\":" << Util::JsonQuote(std::format("r{}", static_cast<int>(dart::PP)));
+		// Frida exposes r10, not Capstone's optional ARM alias "sl".
+		of << "\"thread\":" << Util::JsonQuote(std::format("r{}", static_cast<int>(dart::THR)))
+			<< ",\"pool\":" << Util::JsonQuote(std::format("r{}", static_cast<int>(dart::PP)));
 #else
-	of << "\"thread\":" << Util::JsonQuote(disassembler.GetRegName(CSREG_DART_THR))
-		<< ",\"pool\":" << Util::JsonQuote(disassembler.GetRegName(CSREG_DART_PP));
+		of << "\"thread\":" << Util::JsonQuote(disassembler.GetRegName(CSREG_DART_THR))
+			<< ",\"pool\":" << Util::JsonQuote(disassembler.GetRegName(CSREG_DART_PP));
 #endif
-	of << ",\"stack\":" << Util::JsonQuote(disassembler.GetRegName(CSREG_DART_SP))
-		<< ",\"entrySlots\":" << dart::kLastParamSlotFromEntrySp << ',';
+		of << ",\"stack\":" << Util::JsonQuote(disassembler.GetRegName(CSREG_DART_SP))
+			<< ",\"entrySlots\":" << dart::kLastParamSlotFromEntrySp << ',';
 #if defined(DART_TARGET_OS_ANDROID)
-	of << "\"os\":\"android\",";
+		of << "\"os\":\"android\",";
 #elif defined(DART_TARGET_OS_MACOS_IOS)
-	of << "\"os\":\"ios\",";
+		of << "\"os\":\"ios\",";
 #elif defined(DART_TARGET_OS_MACOS)
-	of << "\"os\":\"macos\",";
+		of << "\"os\":\"macos\",";
 #elif defined(DART_TARGET_OS_WINDOWS)
-	of << "\"os\":\"windows\",";
+		of << "\"os\":\"windows\",";
 #else
-	of << "\"os\":\"linux\",";
+		of << "\"os\":\"linux\",";
 #endif
-	of << "\"wordSize\":" << dart::kWordSize
-		<< ",\"slotSize\":" << dart::kCompressedWordSize;
+		of << "\"wordSize\":" << dart::kWordSize
+			<< ",\"slotSize\":" << dart::kCompressedWordSize;
 #if defined(DART_COMPRESSED_POINTERS)
-	of << ",\"compressed\":true,\"heapBaseOffset\":" << AOT_Thread_heap_base_offset;
+		of << ",\"compressed\":true,\"heapBaseOffset\":" << AOT_Thread_heap_base_offset;
 #else
-	of << ",\"compressed\":false";
+		of << ",\"compressed\":false";
 #endif
-	of << "},\"image\":{\"isolateData\":"
-		<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.isolate_snapshot_data - static_cast<const uint8_t*>(app.lib_base))))
-		<< ",\"isolateInstructions\":"
-		<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.isolate_snapshot_instructions - static_cast<const uint8_t*>(app.lib_base))))
-		<< ",\"checks\":[";
-	// Code bytes identify the input independently of ASLR; never export host pointers.
-	int checks = 0;
-	for (const auto& [address, fn] : app.functions) {
-		if (fn->PayloadSize() < 16)
-			continue;
-		if (checks++) of << ',';
-		const auto offset = fn->PayloadAddress();
-		std::string bytes;
-		for (int i = 0; i < 16; ++i)
-			bytes += std::format("{:02x}", *(reinterpret_cast<const uint8_t*>(app.base() + offset) + i));
-		of << '[' << Util::JsonQuote(std::format("{:#x}", offset)) << ',' << Util::JsonQuote(bytes) << ']';
-		if (checks == 3) break;
-	}
-	of << "]},";
-	dumpScriptLayouts(of);
-	of << ",\"functions\":[\n";
-	bool first = true;
-	auto function = [&](uint64_t address, intptr_t size, const std::string& name) {
-		if (!first) of << ",\n";
-		first = false;
-		of << '[' << Util::JsonQuote(std::format("{:#x}", address)) << ',' << std::max<intptr_t>(0, size)
-			<< ',' << Util::JsonQuote(name) << ']';
-	};
-	for (auto lib : app.libs) {
-		for (auto cls : lib->classes) {
-			for (auto fn : cls->Functions()) {
-				const auto address = fn->Address();
-				const auto name = std::format("{}_{}::{}_{:x}", lib->GetName(), cls->Name(), getFunctionName4Ida(*fn, cls->Name()), address);
-				function(address, fn->Size(), name);
-				if (fn->HasMorphicCode()) {
-					const auto payload = fn->PayloadAddress();
-					const auto mono = fn->MonomorphicAddress();
-					if (payload && payload != address) function(payload, 0, name + "_miss");
-					if (mono && mono != address && mono != payload) function(mono, 0, name + "_check");
+		of << "},\"image\":{\"isolateData\":"
+			<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.isolate_snapshot_data - static_cast<const uint8_t*>(app.lib_base))))
+			<< ",\"isolateInstructions\":"
+			<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.isolate_snapshot_instructions - static_cast<const uint8_t*>(app.lib_base))))
+			<< ",\"checks\":[";
+		// Code bytes identify the input independently of ASLR; never export host pointers.
+		int checks = 0;
+		for (const auto& [address, fn] : app.functions) {
+			if (fn->PayloadSize() < 16)
+				continue;
+			if (checks++) of << ',';
+			const auto offset = fn->PayloadAddress();
+			std::string bytes;
+			for (int i = 0; i < 16; ++i)
+				bytes += std::format("{:02x}", *(reinterpret_cast<const uint8_t*>(app.base() + offset) + i));
+			of << '[' << Util::JsonQuote(std::format("{:#x}", offset)) << ',' << Util::JsonQuote(bytes) << ']';
+			if (checks == 3) break;
+		}
+		of << "]},";
+		dumpScriptLayouts(of);
+		of << ",\"functions\":[\n";
+		bool first = true;
+		auto function = [&](uint64_t address, intptr_t size, const std::string& name) {
+			if (!first) of << ",\n";
+			first = false;
+			of << '[' << Util::JsonQuote(std::format("{:#x}", address)) << ',' << std::max<intptr_t>(0, size)
+				<< ',' << Util::JsonQuote(name) << ']';
+		};
+		for (auto lib : app.libs) {
+			for (auto cls : lib->classes) {
+				for (auto fn : cls->Functions()) {
+					const auto address = fn->Address();
+					const auto name = std::format("{}_{}::{}_{:x}", lib->GetName(), cls->Name(), getFunctionName4Ida(*fn, cls->Name()), address);
+					function(address, fn->Size(), name);
+					if (fn->HasMorphicCode()) {
+						const auto payload = fn->PayloadAddress();
+						const auto mono = fn->MonomorphicAddress();
+						if (payload && payload != address) function(payload, 0, name + "_miss");
+						if (mono && mono != address && mono != payload) function(mono, 0, name + "_check");
+					}
 				}
 			}
 		}
+		for (const auto& [address, stub] : app.stubs)
+			function(address, stub->Size(), std::format("{}_{:x}", stub->FullName(), address));
+		of << "],\"structures\":{";
+		dumpScriptStructures(of);
+		of << "},\"operands\":[\n";
+		dumpScriptOperands(of);
+		of << "],\"analysis\":[";
+		dumpScriptAnalysis(of);
+		of << "]}\n";
+		of.close();
+		std::filesystem::rename(temporary, filename);
 	}
-	for (const auto& [address, stub] : app.stubs)
-		function(address, stub->Size(), std::format("{}_{:x}", stub->FullName(), address));
-	of << "],\"structures\":{";
-	dumpScriptStructures(of);
-	of << "},\"operands\":[\n";
-	dumpScriptOperands(of);
-	of << "],\"analysis\":[";
-	dumpScriptAnalysis(of);
-	of << "]}\n";
+	catch (...) {
+		std::error_code ec;
+		std::filesystem::remove(temporary, ec);
+		throw;
+	}
 }
 
 void DartDumper::dumpScriptAnalysis(std::ostream& of)
@@ -216,37 +230,43 @@ void DartDumper::dumpScriptAnalysis(std::ostream& of)
 			for (auto fn : cls->Functions()) {
 				if (!first) of << ',';
 				first = false;
+				const bool recovered = fn->Ptr() == dart::Function::null();
 				std::ostringstream declaration;
 				fn->PrintHead(declaration);
 				of << '[' << Util::JsonQuote(std::format("{:#x}", fn->Address()))
 					<< ",{\"name\":" << Util::JsonQuote(fn->FullName())
-					<< ",\"kind\":" << static_cast<int>(fn->Kind())
+					<< ",\"kind\":" << (recovered ? "null" : std::to_string(static_cast<int>(fn->Kind())))
 					<< ",\"payload\":" << Util::JsonQuote(std::format("{:#x}", fn->PayloadAddress()))
 					<< ",\"monomorphic\":" << Util::JsonQuote(std::format("{:#x}", fn->MonomorphicAddress()))
 					<< ",\"library\":" << Util::JsonQuote(lib->url)
-					<< ",\"cid\":" << cls->Id()
+					<< ",\"cid\":" << (cls->Ptr() == dart::Class::null() ? "null" : std::to_string(cls->Id()))
 					<< ",\"declaration\":" << Util::JsonQuote(declaration.str())
-					<< ",\"declarationSource\":" << Util::JsonQuote(fn->Ptr() == nullptr ? "recovered" : "snapshot")
-					<< ",\"signature\":{\"returnType\":"
-					<< (fn->Signature().ReturnType() ? Util::JsonQuote(fn->Signature().ReturnType()->ToString()) : "null")
-					<< ",\"optional\":" << fn->NumOptionalParam()
-					<< ",\"named\":" << (fn->HasNamedParam() ? "true" : "false") << ",\"parameters\":[";
-				bool firstParam = true;
-				for (const auto& param : fn->Params()) {
-					if (!firstParam) of << ',';
-					firstParam = false;
-					of << "{\"name\":" << Util::JsonQuote(param.name)
-						<< ",\"type\":" << (param.type ? Util::JsonQuote(param.type->ToString()) : "null")
-						<< ",\"required\":" << (param.isRequired ? "true" : "false") << '}';
+					<< ",\"declarationSource\":" << Util::JsonQuote(recovered ? "recovered" : "snapshot");
+				if (recovered) {
+					of << ",\"signature\":null,\"flags\":null";
 				}
-				of << "]},\"flags\":{";
-				of << "\"static\":" << (fn->IsStatic() ? "true" : "false")
-					<< ",\"closure\":" << (fn->IsClosure() ? "true" : "false")
-					<< ",\"async\":" << (fn->IsAsync() ? "true" : "false")
-					<< ",\"native\":" << (fn->IsNative() ? "true" : "false")
-					<< ",\"ffi\":" << (fn->IsFfi() ? "true" : "false")
-					<< ",\"const\":" << (fn->IsConst() ? "true" : "false")
-					<< ",\"abstract\":" << (fn->IsAbstract() ? "true" : "false") << '}';
+				else {
+					of << ",\"signature\":{\"returnType\":"
+						<< (fn->Signature().ReturnType() ? Util::JsonQuote(fn->Signature().ReturnType()->ToString()) : "null")
+						<< ",\"optional\":" << fn->NumOptionalParam()
+						<< ",\"named\":" << (fn->HasNamedParam() ? "true" : "false") << ",\"parameters\":[";
+					bool firstParam = true;
+					for (const auto& param : fn->Params()) {
+						if (!firstParam) of << ',';
+						firstParam = false;
+						of << "{\"name\":" << Util::JsonQuote(param.name)
+							<< ",\"type\":" << (param.type ? Util::JsonQuote(param.type->ToString()) : "null")
+							<< ",\"required\":" << (param.isRequired ? "true" : "false") << '}';
+					}
+					of << "]},\"flags\":{";
+					of << "\"static\":" << (fn->IsStatic() ? "true" : "false")
+						<< ",\"closure\":" << (fn->IsClosure() ? "true" : "false")
+						<< ",\"async\":" << (fn->IsAsync() ? "true" : "false")
+						<< ",\"native\":" << (fn->IsNative() ? "true" : "false")
+						<< ",\"ffi\":" << (fn->IsFfi() ? "true" : "false")
+						<< ",\"const\":" << (fn->IsConst() ? "true" : "false")
+						<< ",\"abstract\":" << (fn->IsAbstract() ? "true" : "false") << '}';
+				}
 				auto data = fn->GetAnalyzedData();
 				of << ",\"analyzed\":" << (data ? "true" : "false");
 				if (data) {
@@ -339,7 +359,7 @@ void DartDumper::dumpScriptStructures(std::ostream& of)
 						const auto imm = pool.RawValueAt(targetIndex);
 						auto dartFn = app.GetFunction(imm - app.base());
 						if (dartFn != nullptr) {
-							name = std::format("UnlinkedCall_{:#x}_{:#x}", offset, dartFn->Address(), offset);
+							name = std::format("UnlinkedCall_{:#x}_{:#x}", offset, dartFn->Address());
 						}
 						else {
 							name = std::format("UnlinkedCall_{:#x}_unknown", offset);
@@ -347,8 +367,9 @@ void DartDumper::dumpScriptStructures(std::ostream& of)
 					}
 					else {
 						ASSERT(unlinkTargetType == dart::ObjectPool::EntryType::kTaggedObject);
-						const auto imm = pool.RawValueAt(targetIndex);
-						name = std::format("UnlinkedCall_{:#x}_tagged_{:#x}", offset, imm - app.base());
+						name = std::format("UnlinkedCall_{:#x}_tagged", offset);
+						obj = pool.ObjectAt(targetIndex);
+						description = ObjectToString(obj);
 					}
 				}
 			}
@@ -655,9 +676,9 @@ void DartDumper::DumpCode(const char* out_dir)
 
 #ifndef NO_CODE_ANALYSIS
 				// use as app is loaded at zero
-				if (dartFn->Size() > 0) {
-					auto& asmTexts = dartFn->GetAnalyzedData()->asmTexts.Data();
-					auto& il_insns = dartFn->GetAnalyzedData()->il_insns;
+				if (auto data = dartFn->GetAnalyzedData(); data && dartFn->Size() > 0) {
+					auto& asmTexts = data->asmTexts.Data();
+					auto& il_insns = data->il_insns;
 					auto il_itr = il_insns.begin();
 					AddrRange range;
 					ASSERT(!asmTexts.empty());
@@ -679,8 +700,8 @@ void DartDumper::DumpCode(const char* out_dir)
 								extra = fn->FullName();
 								auto retCid = fn->ReturnType();
 								if (retCid != dart::kIllegalCid) {
-									auto retCls = app.classes.at(retCid);
-									extra += std::format(" -> {} (size={:#x})", retCls->FullName(), retCls->Size());
+									if (auto retCls = app.FindClass(retCid))
+										extra += std::format(" -> {} (size={:#x})", retCls->FullName(), retCls->Size());
 								}
 							}
 							break;
@@ -693,14 +714,14 @@ void DartDumper::DumpCode(const char* out_dir)
 							of << "    ";
 						}
 						else {
-							while ((*il_itr)->Start() < asmText.addr) {
+							while (il_itr != il_insns.end() && (*il_itr)->Start() < asmText.addr) {
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
 									of << std::format("{:#x}: {}\n", (*il_itr)->Start(), (*il_itr)->ToString());
 									of << "    // ";
 								}
 								++il_itr;
 							}
-							if ((*il_itr)->Start() == asmText.addr) {
+							if (il_itr != il_insns.end() && (*il_itr)->Start() == asmText.addr) {
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
 									of << std::format("{:#x}: {}\n", asmText.addr, (*il_itr)->ToString());
 									of << "    //     ";
@@ -1099,7 +1120,7 @@ std::string DartDumper::dumpInstanceFields(dart::Object& obj, DartClass& dartCls
 			else {
 				txtField = std::format("off_{:x}: double({})", offset, *((double*)p));
 			}
-			offset += dart::kCompressedWordSize;
+			offset += sizeof(uint64_t) - dart::kCompressedWordSize;
 		}
 		else if (offset != dartCls.TypeArgumentsOffset()) {
 			// compressed object ptr

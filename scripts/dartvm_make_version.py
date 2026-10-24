@@ -30,6 +30,8 @@ def get_git_timestamp():
 # sdk directory
 SDK_DIR = sys.argv[1]
 SNAPSHOT_HASH = sys.argv[2]
+# Resolve before chdir: callers may supply a relative build-directory path.
+version_output = os.path.abspath(sys.argv[3]) if len(sys.argv) > 3 else None
 os.chdir(SDK_DIR)
 SDK_DIR = '.'
 
@@ -44,7 +46,7 @@ version_info['COMMIT_TIME'] = get_git_timestamp()
 version_info['VERSION_STR'] = f'{version_info["MAJOR"]}.{version_info["MINOR"]}.{version_info["PATCH"]}'
 
 version_in_file = os.path.join(SDK_DIR, 'runtime', 'vm', 'version_in.cc')
-version_out_file = os.path.join(SDK_DIR, 'runtime', 'vm', 'version.cc')
+version_out_file = version_output or os.path.join(SDK_DIR, 'runtime', 'vm', 'version.cc')
 
 with open(version_in_file, 'r') as f:
     code = f.read()

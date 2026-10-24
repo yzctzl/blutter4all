@@ -23,9 +23,7 @@ public:
 	uintptr_t heap_base() const { return heap_base_; }
 
 	DartClass* GetClass(intptr_t cid);
-	DartClass* FindClass(intptr_t cid) const {
-		return cid >= 0 && static_cast<size_t>(cid) < classes.size() ? classes[cid] : nullptr;
-	}
+	DartClass* FindClass(intptr_t cid) const;
 	DartFnBase* GetFunction(uint64_t addr);
 	DartFnBase* FindFunctionExact(uint64_t addr) const {
 		if (auto found = functions.find(addr); found != functions.end())
@@ -72,6 +70,7 @@ private:
 
 	// nativeLib contains all classes that has no library
 	DartLibrary nativeLib;
+	DartLibrary* recoveredLib{ nullptr }; // owned by libs; no Library/Function metadata
 	std::vector<DartLibrary*> libs;
 	// some class might be null
 	std::vector<DartClass*> classes;

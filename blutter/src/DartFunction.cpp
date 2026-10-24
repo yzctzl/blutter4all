@@ -204,7 +204,9 @@ void DartFunction::PrintHead(std::ostream& of) const
 	auto& func = dart::Function::Handle(zone, ptr);
 
 	// Note: Signature is not dropped in aot when any named parameter is required. (from Function::IsRequiredAt() body)
-	const auto& sig = dart::FunctionType::Handle(zone, func.signature());
+	auto& sig = dart::FunctionType::Handle(zone);
+	if (!func.IsNull())
+		sig = func.signature();
 
 	of << "  "; // indentation
 	if (is_closure)

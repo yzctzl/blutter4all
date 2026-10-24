@@ -1,4 +1,3 @@
-import io
 import os
 import re
 import requests
@@ -247,7 +246,7 @@ def get_dart_sdk_url_size(engine_ids):
     #url = f'https://storage.googleapis.com/dart-archive/channels/stable/release/3.0.3/sdk/dartsdk-windows-x64-release.zip'
     for engine_id in engine_ids:
         url = f'https://storage.googleapis.com/flutter_infra_release/flutter/{engine_id}/dart-sdk-windows-x64.zip'
-        resp = requests.head(url)
+        resp = requests.head(url, timeout=30)
         if resp.status_code == 200:
            sdk_size = int(resp.headers['Content-Length'])
            return engine_id, url, sdk_size
@@ -255,38 +254,55 @@ def get_dart_sdk_url_size(engine_ids):
     return None, None, None
 
 def get_dart_commit(url):
-    # in downloaded zip
-    # * dart-sdk/revision - the dart commit id of https://github.com/dart-lang/sdk/
-    # * dart-sdk/version  - the dart version
-    # revision and version zip file records should be in first 4096 bytes
-    # using stream in case a server does not support range
-    commit_id = None
-    dart_version = None
-    fp = None
-    with requests.get(url, headers={"Range": "bytes=0-4096"}, stream=True) as r:
-        if r.status_code // 10 == 20:
-            x = next(r.iter_content(chunk_size=4096))
-            fp = io.BytesIO(x)
-    
-    if fp is not None:
-        while fp.tell() < 4096-30 and (commit_id is None or dart_version is None):
-            #sig, ver, flags, compression, filetime, filedate, crc, compressSize, uncompressSize, filenameLen, extraLen = unpack(fp, '<IHHHHHIIIHH')
-            _, _, _, compMethod, _, _, _, compressSize, _, filenameLen, extraLen = unpack('<IHHHHHIIIHH', fp.read(30))
-            filename = fp.read(filenameLen)
-            #print(filename)
-            if extraLen > 0:
-                fp.seek(extraLen, io.SEEK_CUR)
-            data = fp.read(compressSize)
-            
-            # expect compression method to be zipfile.ZIP_DEFLATED
-            assert compMethod == zipfile.ZIP_DEFLATED, 'Unexpected compression method'
-            if filename == b'dart-sdk/revision':
-                commit_id = zlib.decompress(data, wbits=-zlib.MAX_WBITS).decode().strip()
-            elif filename == b'dart-sdk/version':
-                dart_version = zlib.decompress(data, wbits=-zlib.MAX_WBITS).decode().strip()
-    
-    # TODO: if no revision and version in first 4096 bytes, get the file location from the first zip dir entries at the end of file (less than 256KB)
-    return commit_id, dart_version
+    # Read only the archive prefix, even when the server ignores Range.
+    limit = 64 * 1024
+    prefix = bytearray()
+    with requests.get(url, headers={"Range": f"bytes=0-{limit - 1}"},
+                      stream=True, timeout=30) as response:
+        response.raise_for_status()
+        for chunk in response.iter_content(chunk_size=4096):
+            prefix.extend(chunk[:limit - len(prefix)])
+            if len(prefix) == limit:
+                break
+
+    values = {}
+    offset = 0
+    while offset + 30 <= len(prefix):
+        signature, _, flags, method, _, _, crc, size, unpacked, name_len, extra_len = unpack(
+            '<IHHHHHIIIHH', prefix[offset:offset + 30])
+        if signature != 0x04034b50 or flags & 0x09:
+            break  # Central directory, encryption or unknown data-descriptor size.
+        name = bytes(prefix[offset + 30:offset + 30 + name_len])
+        start = offset + 30 + name_len + extra_len
+        end = start + size
+        if end > len(prefix):
+            break
+        if name in (b'dart-sdk/revision', b'dart-sdk/version'):
+            if unpacked > 4096:
+                raise ValueError('Dart SDK version record is too large')
+            data = bytes(prefix[start:end])
+            if method == zipfile.ZIP_DEFLATED:
+                decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+                try:
+                    data = decoder.decompress(data, 4097)
+                except zlib.error as error:
+                    raise ValueError('Invalid compressed Dart SDK version record') from error
+                if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+                    raise ValueError('Truncated or oversized Dart SDK version record')
+            elif method != zipfile.ZIP_STORED:
+                raise ValueError('Unsupported Dart SDK version record compression')
+            if len(data) != unpacked or zlib.crc32(data) != crc:
+                raise ValueError('Corrupt Dart SDK version record')
+            values[name] = data.decode('utf-8').strip()
+            if len(values) == 2:
+                break
+        offset = end
+
+    version = values.get(b'dart-sdk/version')
+    if not version or re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?', version) is None:
+        raise ValueError('Cannot determine Dart version from SDK archive prefix; use --dart-version')
+    return values.get(b'dart-sdk/revision'), version
+
 
 def extract_dart_info(libapp_file: str, libflutter_file: str, target_arch=None):
     apple = binary_format(libapp_file) == 'macho'

@@ -139,7 +139,7 @@ def find_compat_macro(dart_version: str, no_analysis: bool):
             macros.append('-DHAS_TYPE_REF=1')
         # in main branch, RecordType is added in Dart 3.0 while TypeRef is removed in Dart 3.1
         # in Dart 2.19, RecordType might be added to a source code but incomplete
-        if dart_version.startswith('3.') and mm.find(b'V(RecordType)') != -1:
+        if int(dart_version.split('.', 1)[0]) >= 3 and mm.find(b'V(RecordType)') != -1:
             macros.append('-DHAS_RECORD_TYPE=1')
     
     with open(os.path.join(vm_path, 'class_table.h'), 'rb') as f:

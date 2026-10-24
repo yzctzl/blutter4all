@@ -25,6 +25,8 @@ int main(int argc, char** argv)
 			return 1;
 		}
 
+		// A failed load or analysis must not leave metadata from an earlier run.
+		std::filesystem::remove(outDir / "script_data.json");
 		DartApp app{ libappPath.c_str() };
 		std::cout << std::format("libapp is loaded at {:#x}\n", static_cast<uintptr_t>(app.base()));
 		std::cout << std::format("Dart heap at {:#x}\n", app.heap_base());

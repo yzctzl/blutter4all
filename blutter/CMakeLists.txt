@@ -65,9 +65,9 @@ if (MSVC)
 	# for dynamic function (exception) table
 	target_link_libraries(${BINNAME} PRIVATE ntdll)
 	# remove compiler exception handler options
-	#string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
+	#string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 	# remove compiler RTTI option
-	string(REPLACE "/GR" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
+	string(REPLACE "/GR" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 	#set(cc_opts /Oy /GR- /EHs-c-)
 	if (CMAKE_GENERATOR MATCHES "Visual Studio")
 		# use SEMIDBG for enabling ASSERT macro while linking against release build of Dart VM

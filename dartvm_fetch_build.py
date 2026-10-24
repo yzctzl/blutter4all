@@ -1,5 +1,6 @@
 import mmap
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -47,20 +48,24 @@ class DartLibInfo:
         self.lib_name = f'dartvm{version}_{os_name}_{arch}'
         if not self.has_compressed_ptrs:
             self.lib_name += '_no-compressed-ptrs'
+        if snapshot_hash is not None:
+            if re.fullmatch(r'[0-9a-f]{32}', snapshot_hash) is None:
+                raise ValueError('Invalid Dart snapshot hash')
+            self.lib_name += '_snapshot-' + snapshot_hash
 
 
 def checkout_dart(info: DartLibInfo):
     clonedir = os.path.join(SDK_DIR, 'v'+info.version)
 
-    # if no version file,assume previous clone is failed. delete the whole directory and try again.
-    version_file = os.path.join(clonedir, 'runtime', 'vm', 'version.cc')
+    # A missing version template indicates an incomplete SDK checkout.
+    version_file = os.path.join(clonedir, 'runtime', 'vm', 'version_in.cc')
     if os.path.exists(clonedir) and not os.path.exists(version_file):
         print('Delete incomplete clone directory ' + clonedir)
         def remove_readonly(func, path, _):
             os.chmod(path, stat.S_IWRITE)
             func(path)
         shutil.rmtree(clonedir, onerror=remove_readonly)
-    
+
     # clone Dart source code
     if not os.path.exists(clonedir):
         # minimum clone repository at the target branch
@@ -77,36 +82,11 @@ def checkout_dart(info: DartLibInfo):
                     # should ".git" directory be removed?
                     pass
 
-        if info.snapshot_hash is None:
-            # if running with Python 3.12, tools/utils.py should be patched to replace imp module with importlib
-            # due to its remotion as stated in: https://docs.python.org/3.12/whatsnew/3.12.html#imp
-            if sys.version_info[:2] >= (3, 12):
-                utils_path = os.path.join(clonedir, "tools/utils.py")
-                if os.path.exists(utils_path):
-                    with open(utils_path, "r+") as f:
-                        content = f.read()
-                        # the python 3.12 warnings are fixed in https://github.com/dart-lang/sdk/commit/a100968232c7492ab0de26897ff019e5784d4d38
-                        if r"match_against('^MAJOR (\d+)$', content)" in content:
-                            # old Dart version
-                            # replace invalid escape sequences strings with raw strings to avoid SyntaxWarning
-                            # in future Python versions this warning will raise an error instead of warning
-                            # as stated in: https://docs.python.org/3/whatsnew/3.12.html#other-language-changes
-                            content = content.replace(" ' awk ", " r' awk ").replace("match_against('", "match_against(r'").replace("re.search('", "re.search(r'")
-                            if "import imp\n" in content:
-                                content = content.replace("import imp\n", imp_replace_snippet).replace("imp.load_source", "load_source")
-                            f.seek(0)
-                            f.truncate()
-                            f.write(content)
-            # make version
-            subprocess.run([sys.executable, 'tools/make_version.py', '--output', 'runtime/vm/version.cc', '--input', 'runtime/vm/version_in.cc'], cwd=clonedir, check=True)
-        else:
-            subprocess.run([sys.executable, MAKE_VERSION_FILE, clonedir, info.snapshot_hash], check=True)
-        
         if sys.platform == 'win32':
             # since Dart 3.8, RUNTIME_FUNCTION is declared when DART_HOST_OS_WINDOWS and TARGET_ARCH_ARM64 are set
             # patch "runtime/platform/unwinding_records.h" to remove the declaration
             vers = info.version.split('.', 2)
-            if int(vers[0]) >= 3 and int(vers[1]) >= 8:
+            if tuple(map(int, vers[:2])) >= (3, 8):
                 with open(os.path.join(clonedir, 'runtime', 'platform', 'unwinding_records.h'), 'r+b') as f:
                     mm = mmap.mmap(f.fileno(), 0)
                     pos = mm.find(b'\n#if !defined(DART_HOST_OS_WINDOWS) || !defined(HOST_ARCH_ARM64)')
@@ -118,10 +98,39 @@ def checkout_dart(info: DartLibInfo):
                         pos = mm.find(b'\nstatic_assert(sizeof(')
                         if pos != -1:
                             mm[pos+1:pos+3] = b'//'
-    
+
     return clonedir
 
 def cmake_dart(info: DartLibInfo, target_dir: str):
+    # The SDK source directory is shared; version.cc belongs to this snapshot.
+    builddir = os.path.join(BUILD_DIR, info.lib_name)
+    os.makedirs(builddir, exist_ok=True)
+    version_file = os.path.join(builddir, 'version.cc')
+    if info.snapshot_hash is None:
+        # if running with Python 3.12, tools/utils.py should be patched to replace imp module with importlib
+        # due to its remotion as stated in: https://docs.python.org/3.12/whatsnew/3.12.html#imp
+        if sys.version_info[:2] >= (3, 12):
+            utils_path = os.path.join(target_dir, "tools/utils.py")
+            if os.path.exists(utils_path):
+                with open(utils_path, "r+") as f:
+                    content = f.read()
+                    # the python 3.12 warnings are fixed in https://github.com/dart-lang/sdk/commit/a100968232c7492ab0de26897ff019e5784d4d38
+                    if r"match_against('^MAJOR (\d+)$', content)" in content:
+                        # old Dart version
+                        # replace invalid escape sequences strings with raw strings to avoid SyntaxWarning
+                        # in future Python versions this warning will raise an error instead of warning
+                        # as stated in: https://docs.python.org/3/whatsnew/3.12.html#other-language-changes
+                        content = content.replace(" ' awk ", " r' awk ").replace("match_against('", "match_against(r'").replace("re.search('", "re.search(r'")
+                        if "import imp\n" in content:
+                            content = content.replace("import imp\n", imp_replace_snippet).replace("imp.load_source", "load_source")
+                        f.seek(0)
+                        f.truncate()
+                        f.write(content)
+        # make version
+        subprocess.run([sys.executable, 'tools/make_version.py', '--output', version_file, '--input', 'runtime/vm/version_in.cc'], cwd=target_dir, check=True)
+    else:
+        subprocess.run([sys.executable, MAKE_VERSION_FILE, target_dir, info.snapshot_hash, version_file], check=True)
+
     # Dart 3.11.0+ requires C++20 https://github.com/dart-lang/sdk/commit/3ebbaf08fb9236023b8f37bb9e9de85a9be8e281
     # getting default cpp standard version for Dart SDK from "runtime/tools/run_clang_tidy.dart"
     #   because "build/config/compiler/BUILD.gn" is not fetched
@@ -133,7 +142,7 @@ def cmake_dart(info: DartLibInfo, target_dir: str):
         pos = content.find("-std=c++")
         # Note: very old Dart, there is no '-std=c++' option in run_clang_tidy.dart
         cpp_std = "17" if pos == -1 else content[pos+8:pos+10]
-    
+
     # On windows, need developer command prompt for x64 (can check with "cl" command)
     # create dartsdk/vx.y.z/CMakefile.list
     with open(CMAKE_TEMPLATE_FILE, 'r') as f:
@@ -145,18 +154,17 @@ def cmake_dart(info: DartLibInfo, target_dir: str):
     with open(os.path.join(target_dir, 'Config.cmake.in'), 'w') as f:
         f.write('@PACKAGE_INIT@\n\n')
         f.write('include ( "${CMAKE_CURRENT_LIST_DIR}/dartvmTarget.cmake" )\n\n')
-    
+
     # generate source list
     subprocess.run([sys.executable, CREATE_SRCLIST_FILE, target_dir], check=True)
     # cmake -GNinja -Bout3.0.3 -DCMAKE_BUILD_TYPE=Release
     #   add -DTARGET_ARCH=x64 for analyzing x64 libapp.so
     #   add -DTARGET_OS=ios for analyzing ios App
     # Pointer compression affects snapshot layout and is part of the library key.
-    builddir = os.path.join(BUILD_DIR, info.lib_name)
-    subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DTARGET_OS={info.os_name}', f'-DTARGET_ARCH={info.arch}', 
-        f'-DCOMPRESSED_PTRS={1 if info.has_compressed_ptrs else 0}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'], 
+    subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DTARGET_OS={info.os_name}', f'-DTARGET_ARCH={info.arch}',
+        f'-DVERSION_FILE={version_file}', f'-DCOMPRESSED_PTRS={1 if info.has_compressed_ptrs else 0}', f'-DSNAPSHOT_HASH={info.snapshot_hash or ""}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'],
         cwd=target_dir, check=True)
-    
+
     # build and install dart vm library to packages directory
     subprocess.run([CMAKE_CMD, '--build', builddir], check=True)
     subprocess.run([CMAKE_CMD, '--install', '.'], cwd=builddir, check=True)

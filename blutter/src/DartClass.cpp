@@ -207,6 +207,10 @@ std::string DartClass::FullNameWithPackage() const
 
 void DartClass::PrintHead(std::ostream& of)
 {
+	if (ptr == dart::Class::null()) {
+		of << "\n// Recovered Code objects; class metadata is unavailable\n";
+		return;
+	}
 	if (superCls == NULL)
 		of << std::format("\n// class id: {}, size: {:#x}\n", id, size);
 	else
@@ -266,5 +270,7 @@ void DartClass::PrintHead(std::ostream& of)
 
 void DartClass::PrintFoot(std::ostream& of)
 {
+	if (ptr == dart::Class::null())
+		return;
 	of << "}\n";
 }

@@ -96,13 +96,22 @@ void DartApp::ExitScope()
 	}
 }
 
+DartClass* DartApp::FindClass(intptr_t cid) const
+{
+	if (cid < 0)
+		return nullptr;
+	if (dart::ClassTable::IsTopLevelCid(cid)) {
+		const auto index = dart::ClassTable::IndexFromTopLevelCid(cid);
+		return static_cast<size_t>(index) < topClasses.size() ? topClasses[index] : nullptr;
+	}
+	return static_cast<size_t>(cid) < classes.size() ? classes[cid] : nullptr;
+}
+
 DartClass* DartApp::GetClass(intptr_t cid)
 {
-	if ((size_t)cid > classes.size()) {
-		// assume top level class
+	if (cid >= 0 && dart::ClassTable::IsTopLevelCid(cid))
 		return topClasses.at(dart::ClassTable::IndexFromTopLevelCid(cid));
-	}
-	return classes.at(cid);
+	return classes.at(static_cast<size_t>(cid));
 }
 
 DartFnBase* DartApp::GetFunction(uint64_t addr)
@@ -517,11 +526,18 @@ void DartApp::findFunctionInHeap()
 			auto ownerClassId = code.OwnerClassId();
 			ASSERT(ownerClassId == dart::kFunctionCid);
 			if (!functions.contains(ep_offset)) {
-				// no function, can only make it into top class of native library
-				if (!nativeLib.topClass) {
-					nativeLib.topClass = new DartClass(nativeLib);
+				// Keep ownerless Code in the normal analysis/export traversal,
+				// without treating VM native classes as application libraries.
+				if (!recoveredLib) {
+					recoveredLib = new DartLibrary(0xdeadead);
+					recoveredLib->url = "b4a:recovered";
+					recoveredLib->name = "Recovered code";
+					recoveredLib->isInternal = false;
+					recoveredLib->topClass = new DartClass(*recoveredLib);
+					recoveredLib->classes.push_back(recoveredLib->topClass);
+					libs.push_back(recoveredLib);
 				}
-				auto dartFn = nativeLib.topClass->AddFunction(code);
+				auto dartFn = recoveredLib->topClass->AddFunction(code);
 				functions[dartFn->Address()] = dartFn;
 			}
 		}
@@ -743,7 +759,7 @@ void DartApp::walkObject(dart::Object& obj)
 				dartCls->AddField(offset, typeDb->Get(dart::kDoubleCid));
 			}
 			//std::cout << std::format("    offset_{:x} : int({:#x})\n", offset, *p);
-			offset += dart::kCompressedWordSize * 2;
+			offset += sizeof(uint64_t);
 		}
 		else {
 			auto p = reinterpret_cast<dart::CompressedObjectPtr*>(ptr + offset);

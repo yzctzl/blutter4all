@@ -277,7 +277,7 @@ def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no
     if os.path.isfile(indir) and extension in ('.apk', '.ipa', '.zip'):
         scratch = os.path.join(SCRIPT_DIR, 'temp')
         os.makedirs(scratch, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix='blutter-input-', dir=scratch) as tmp_dir:
+        with tempfile.TemporaryDirectory(prefix='b4a-input-', dir=scratch) as tmp_dir:
             extract = extract_libs_from_apk if extension == '.apk' else extract_libs_from_apple_archive
             libapp_file, libflutter_file = (extract(indir, tmp_dir, target_arch) if extension == '.apk'
                                            else extract(indir, tmp_dir))
@@ -287,10 +287,10 @@ def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no
         main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, target_arch)
 
 
-if __name__ == "__main__":
+def cli():
     parser = argparse.ArgumentParser(
-        prog='B(l)utter',
-        description='Reversing a flutter application tool')
+        prog='b4a.py',
+        description='Analyze Flutter Dart AOT snapshots')
     parser.add_argument('indir', help='An APK, IPA, macOS app ZIP, app bundle, or directory containing the AOT and engine binaries')
     parser.add_argument('outdir', help='An output directory')
     parser.add_argument('--arch', choices=('arm64', 'x64', 'arm'), help='Select APK ABI or universal Mach-O architecture (default: arm64 when available)')
@@ -305,3 +305,7 @@ if __name__ == "__main__":
         main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.arch)
     else:
         main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+
+
+if __name__ == "__main__":
+    cli()

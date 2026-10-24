@@ -53,7 +53,7 @@ sudo apt install python3 python3-venv git cmake ninja-build \
     build-essential pkg-config libicu-dev libcapstone-dev
 python3 -m venv .venv
 . .venv/bin/activate
-pip install pyelftools requests
+pip install 'lief>=1.0,<1.1' requests
 ```
 
 Android ARMv7 additionally requires a 32-bit compiler toolchain and 32-bit ICU
@@ -67,7 +67,7 @@ Install Xcode Command Line Tools and Homebrew, then:
 brew install cmake ninja pkg-config icu4c capstone
 python3 -m venv .venv
 . .venv/bin/activate
-pip install pyelftools requests
+pip install 'lief>=1.0,<1.1' requests
 ```
 
 Install a newer LLVM toolchain if the system compiler lacks `std::format` support.
@@ -81,7 +81,7 @@ Install Python 3.9+, Git and Visual Studio with **Desktop development with C++**
 ```bat
 python -m venv .venv
 .venv\Scripts\activate
-pip install pyelftools requests
+pip install "lief>=1.0,<1.1" requests
 python scripts\init_env_win.py
 ```
 

@@ -171,6 +171,7 @@ private:
 };
 } // namespace X64
 
+constexpr x86_reg CSREG_DART_SP = X86_REG_RSP;
 constexpr x86_reg CSREG_DART_THR = X86_REG_R14;
 constexpr x86_reg CSREG_DART_PP = X86_REG_R15;
 static_assert(dart::THR == dart::R14 && dart::PP == dart::R15);

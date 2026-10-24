@@ -26,6 +26,7 @@ public:
 	bool IsConst() const { return is_const; }
 
 	DartAbstractType* Type() const { return type; }
+	std::string TypeName() const { return type ? type->ToString() : typeName; }
 	void SetType(DartAbstractType* type) { this->type = type; }
 
 	const DartClass& cls;

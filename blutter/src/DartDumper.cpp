@@ -11,6 +11,7 @@
 #include "Disassembler.h"
 #include "DartThreadInfo.h"
 #include "CodeAnalyzer.h"
+#include "vm/stack_frame.h"
 
 // TODO: move arm64 specific code to *_arm64 file
 
@@ -81,6 +82,535 @@ static std::string getFunctionName4Ida(const DartFunction& dartFn, const std::st
 	}
 
 	return prefix + fnName;
+}
+
+// Export facts once. Tool APIs and source-language escaping live in Python/templates.
+void DartDumper::DumpScriptData(const std::filesystem::path& filename)
+{
+	std::ofstream of(filename);
+	of.exceptions(std::ios::badbit | std::ios::failbit);
+	of << "{\"schema\":1,\"dart\":" << Util::JsonQuote(Dart_VersionString()) << ",\"target\":{";
+#if defined(TARGET_ARCH_ARM64)
+	of << "\"arch\":\"arm64\",";
+#elif defined(TARGET_ARCH_X64)
+	of << "\"arch\":\"x64\",";
+#else
+	of << "\"arch\":\"arm\",";
+#endif
+	Disassembler disassembler;
+#if defined(TARGET_ARCH_ARM)
+	// Frida exposes r10, not Capstone's optional ARM alias "sl".
+	of << "\"thread\":" << Util::JsonQuote(std::format("r{}", static_cast<int>(dart::THR)))
+		<< ",\"pool\":" << Util::JsonQuote(std::format("r{}", static_cast<int>(dart::PP)));
+#else
+	of << "\"thread\":" << Util::JsonQuote(disassembler.GetRegName(CSREG_DART_THR))
+		<< ",\"pool\":" << Util::JsonQuote(disassembler.GetRegName(CSREG_DART_PP));
+#endif
+	of << ",\"stack\":" << Util::JsonQuote(disassembler.GetRegName(CSREG_DART_SP))
+		<< ",\"entrySlots\":" << dart::kLastParamSlotFromEntrySp << ',';
+#if defined(DART_TARGET_OS_ANDROID)
+	of << "\"os\":\"android\",";
+#elif defined(DART_TARGET_OS_MACOS_IOS)
+	of << "\"os\":\"ios\",";
+#elif defined(DART_TARGET_OS_MACOS)
+	of << "\"os\":\"macos\",";
+#elif defined(DART_TARGET_OS_WINDOWS)
+	of << "\"os\":\"windows\",";
+#else
+	of << "\"os\":\"linux\",";
+#endif
+	of << "\"wordSize\":" << dart::kWordSize
+		<< ",\"slotSize\":" << dart::kCompressedWordSize;
+#if defined(DART_COMPRESSED_POINTERS)
+	of << ",\"compressed\":true,\"heapBaseOffset\":" << AOT_Thread_heap_base_offset;
+#else
+	of << ",\"compressed\":false";
+#endif
+	of << "},\"image\":{\"isolateData\":"
+		<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.isolate_snapshot_data - static_cast<const uint8_t*>(app.lib_base))))
+		<< ",\"isolateInstructions\":"
+		<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.isolate_snapshot_instructions - static_cast<const uint8_t*>(app.lib_base))))
+		<< ",\"checks\":[";
+	// Code bytes identify the input independently of ASLR; never export host pointers.
+	int checks = 0;
+	for (const auto& [address, fn] : app.functions) {
+		if (fn->PayloadSize() < 16)
+			continue;
+		if (checks++) of << ',';
+		const auto offset = fn->PayloadAddress();
+		std::string bytes;
+		for (int i = 0; i < 16; ++i)
+			bytes += std::format("{:02x}", *(reinterpret_cast<const uint8_t*>(app.base() + offset) + i));
+		of << '[' << Util::JsonQuote(std::format("{:#x}", offset)) << ',' << Util::JsonQuote(bytes) << ']';
+		if (checks == 3) break;
+	}
+	of << "]},";
+	dumpScriptLayouts(of);
+	of << ",\"functions\":[\n";
+	bool first = true;
+	auto function = [&](uint64_t address, intptr_t size, const std::string& name) {
+		if (!first) of << ",\n";
+		first = false;
+		of << '[' << Util::JsonQuote(std::format("{:#x}", address)) << ',' << std::max<intptr_t>(0, size)
+			<< ',' << Util::JsonQuote(name) << ']';
+	};
+	for (auto lib : app.libs) {
+		for (auto cls : lib->classes) {
+			for (auto fn : cls->Functions()) {
+				const auto address = fn->Address();
+				const auto name = std::format("{}_{}::{}_{:x}", lib->GetName(), cls->Name(), getFunctionName4Ida(*fn, cls->Name()), address);
+				function(address, fn->Size(), name);
+				if (fn->HasMorphicCode()) {
+					const auto payload = fn->PayloadAddress();
+					const auto mono = fn->MonomorphicAddress();
+					if (payload && payload != address) function(payload, 0, name + "_miss");
+					if (mono && mono != address && mono != payload) function(mono, 0, name + "_check");
+				}
+			}
+		}
+	}
+	for (const auto& [address, stub] : app.stubs)
+		function(address, stub->Size(), std::format("{}_{:x}", stub->FullName(), address));
+	of << "],\"structures\":{";
+	dumpScriptStructures(of);
+	of << "},\"operands\":[\n";
+	dumpScriptOperands(of);
+	of << "],\"analysis\":[";
+	dumpScriptAnalysis(of);
+	of << "]}\n";
+}
+
+void DartDumper::dumpScriptAnalysis(std::ostream& of)
+{
+	auto registerName = [](CpuRegister reg) {
+		if (!reg.IsSet()) return std::string("null");
+#if defined(TARGET_ARCH_ARM64)
+		if (!reg.IsDecimal()) {
+			if (static_cast<int>(reg) == 29) return Util::JsonQuote("fp");
+			if (static_cast<int>(reg) == 30) return Util::JsonQuote("lr");
+			return Util::JsonQuote(std::format("x{}", static_cast<int>(reg)));
+		}
+#elif defined(TARGET_ARCH_ARM)
+		if (!reg.IsDecimal()) {
+			if (reg == CpuRegister{dart::SPREG}) return Util::JsonQuote("sp");
+			if (static_cast<int>(reg) == 14) return Util::JsonQuote("lr");
+			return Util::JsonQuote(std::format("r{}", static_cast<int>(reg)));
+		}
+#endif
+		return Util::JsonQuote(reg.Name());
+	};
+	bool first = true;
+	auto parameter = [&](const FnParamInfo& param) {
+		of << "{\"description\":" << Util::JsonQuote(param.ToString())
+			<< ",\"name\":" << Util::JsonQuote(param.name)
+			<< ",\"type\":" << (param.type ? Util::JsonQuote(param.type->ToString()) : "null")
+			<< ",\"entryRegister\":" << registerName(param.paramReg)
+			<< ",\"fpOffset\":" << param.paramOffset
+			<< ",\"valueRegister\":" << registerName(param.valReg)
+			<< ",\"localOffset\":" << param.localOffset
+			<< ",\"default\":" << (param.val ? Util::JsonQuote(param.val->ToString()) : "null") << '}';
+	};
+	for (auto lib : app.libs) {
+		for (auto cls : lib->classes) {
+			for (auto fn : cls->Functions()) {
+				if (!first) of << ',';
+				first = false;
+				std::ostringstream declaration;
+				fn->PrintHead(declaration);
+				of << '[' << Util::JsonQuote(std::format("{:#x}", fn->Address()))
+					<< ",{\"name\":" << Util::JsonQuote(fn->FullName())
+					<< ",\"kind\":" << static_cast<int>(fn->Kind())
+					<< ",\"payload\":" << Util::JsonQuote(std::format("{:#x}", fn->PayloadAddress()))
+					<< ",\"monomorphic\":" << Util::JsonQuote(std::format("{:#x}", fn->MonomorphicAddress()))
+					<< ",\"library\":" << Util::JsonQuote(lib->url)
+					<< ",\"cid\":" << cls->Id()
+					<< ",\"declaration\":" << Util::JsonQuote(declaration.str())
+					<< ",\"declarationSource\":" << Util::JsonQuote(fn->Ptr() == nullptr ? "recovered" : "snapshot")
+					<< ",\"signature\":{\"returnType\":"
+					<< (fn->Signature().ReturnType() ? Util::JsonQuote(fn->Signature().ReturnType()->ToString()) : "null")
+					<< ",\"optional\":" << fn->NumOptionalParam()
+					<< ",\"named\":" << (fn->HasNamedParam() ? "true" : "false") << ",\"parameters\":[";
+				bool firstParam = true;
+				for (const auto& param : fn->Params()) {
+					if (!firstParam) of << ',';
+					firstParam = false;
+					of << "{\"name\":" << Util::JsonQuote(param.name)
+						<< ",\"type\":" << (param.type ? Util::JsonQuote(param.type->ToString()) : "null")
+						<< ",\"required\":" << (param.isRequired ? "true" : "false") << '}';
+				}
+				of << "]},\"flags\":{";
+				of << "\"static\":" << (fn->IsStatic() ? "true" : "false")
+					<< ",\"closure\":" << (fn->IsClosure() ? "true" : "false")
+					<< ",\"async\":" << (fn->IsAsync() ? "true" : "false")
+					<< ",\"native\":" << (fn->IsNative() ? "true" : "false")
+					<< ",\"ffi\":" << (fn->IsFfi() ? "true" : "false")
+					<< ",\"const\":" << (fn->IsConst() ? "true" : "false")
+					<< ",\"abstract\":" << (fn->IsAbstract() ? "true" : "false") << '}';
+				auto data = fn->GetAnalyzedData();
+				of << ",\"analyzed\":" << (data ? "true" : "false");
+				if (data) {
+					of << ",\"stackSize\":" << data->stackSize
+						<< ",\"stackOverflowCheck\":" << Util::JsonQuote(std::format("{:#x}", data->firstCheckStackOverflowAddr))
+						<< ",\"framePointer\":" << (data->useFramePointer ? "true" : "false")
+						<< ",\"returnType\":" << (data->returnType ? Util::JsonQuote(data->returnType->ToString()) : "null")
+						<< ",\"parametersPartial\":" << (data->params.isPartial ? "true" : "false")
+						<< ",\"fixedParameters\":" << static_cast<int>(data->params.numFixedParam)
+						<< ",\"namedParameters\":" << (data->params.isNamedParam ? "true" : "false")
+						<< ",\"parameters\":[";
+					for (size_t i = 0; i < data->params.params.size(); ++i) {
+						if (i) of << ',';
+						parameter(data->params.params[i]);
+					}
+					of << "],\"incoming\":[";
+					for (size_t i = 0; i < data->incomingParameters.size(); ++i) {
+						if (i) of << ',';
+						parameter(data->incomingParameters[i]);
+					}
+					of << "],\"closureContext\":{\"register\":"
+						<< registerName(data->closureContextReg)
+						<< ",\"localOffset\":" << data->closureContextLocalOffset
+						<< "},\"typeArguments\":{\"register\":"
+						<< registerName(data->typeArgumentReg)
+						<< ",\"localOffset\":" << data->typeArgumentLocalOffset << "},\"il\":[";
+					for (size_t i = 0; i < data->il_insns.size(); ++i) {
+						if (i) of << ',';
+						auto& il = data->il_insns[i];
+						of << '[' << Util::JsonQuote(std::format("{:#x}", il->Start()))
+							<< ',' << Util::JsonQuote(std::format("{:#x}", il->End()))
+							<< ',' << static_cast<int>(il->Kind()) << ',' << Util::JsonQuote(il->ToString()) << ']';
+					}
+					of << "],\"annotations\":[";
+					bool firstAnnotation = true;
+					for (const auto& text : data->asmTexts.Data()) {
+						std::string comment;
+						switch (text.dataType) {
+						case AsmText::ThreadOffset: comment = "THR::" + GetThreadOffsetName(text.threadOffset); break;
+						case AsmText::PoolOffset: comment = getPoolObjectDescription(text.poolOffset); break;
+						case AsmText::Boolean: comment = text.boolVal ? "true" : "false"; break;
+						case AsmText::Call:
+							if (auto target = app.GetFunction(text.callAddress)) comment = target->FullName();
+							break;
+						}
+						if (comment.empty()) continue;
+						if (!firstAnnotation) of << ',';
+						firstAnnotation = false;
+						of << '[' << Util::JsonQuote(std::format("{:#x}", text.addr)) << ',' << Util::JsonQuote(comment) << ']';
+					}
+					of << ']';
+				}
+				of << "}]";
+			}
+		}
+	}
+}
+
+void DartDumper::dumpScriptStructures(std::ostream& of)
+{
+	of << "\"DartThread\":[";
+	for (intptr_t offset = 0; offset <= GetThreadMaxOffset(); offset += dart::kWordSize) {
+		if (offset) of << ',';
+		const auto& name = GetThreadOffsetName(static_cast<int>(offset));
+		of << '[' << offset << ',' << Util::JsonQuote(name.empty() ? std::format("pad_{:x}", offset) : name) << ",\"\"]\n";
+	}
+	of << "],\"DartObjectPool\":[";
+	// ObjectPool entries use machine words, including in compressed snapshots.
+	const auto headerSize = dart::ObjectPool::element_offset(0);
+	for (intptr_t offset = 0; offset < headerSize; offset += dart::kWordSize) {
+		if (offset) of << ',';
+		of << '[' << offset << ',' << Util::JsonQuote(std::format("pad_{:x}", offset)) << ",\"\"]";
+	}
+	const auto& pool = app.GetObjectPool();
+	const auto num = pool.Length();
+	auto& obj = dart::Object::Handle();
+	for (intptr_t i = 0; i < num; ++i) {
+		const auto offset = dart::ObjectPool::element_offset(i);
+		std::string name, description;
+		auto objType = pool.TypeAt(i);
+		if (objType == dart::ObjectPool::EntryType::kTaggedObject) {
+			obj = pool.ObjectAt(i);
+			if (obj.IsUnlinkedCall()) {
+				const auto targetIndex = UnlinkedCallTargetIndex(i);
+				name = std::format("UnlinkedCall_{:#x}_unknown", offset);
+				if (targetIndex >= 0 && targetIndex < num) {
+					// since Dart 3.10, target type might be kTaggedObject
+					auto unlinkTargetType = pool.TypeAt(targetIndex);
+					if (unlinkTargetType == dart::ObjectPool::EntryType::kImmediate) {
+						const auto imm = pool.RawValueAt(targetIndex);
+						auto dartFn = app.GetFunction(imm - app.base());
+						if (dartFn != nullptr) {
+							name = std::format("UnlinkedCall_{:#x}_{:#x}", offset, dartFn->Address(), offset);
+						}
+						else {
+							name = std::format("UnlinkedCall_{:#x}_unknown", offset);
+						}
+					}
+					else {
+						ASSERT(unlinkTargetType == dart::ObjectPool::EntryType::kTaggedObject);
+						const auto imm = pool.RawValueAt(targetIndex);
+						name = std::format("UnlinkedCall_{:#x}_tagged_{:#x}", offset, imm - app.base());
+					}
+				}
+			}
+			else {
+				// TODO: more meaningful variable name
+				name = std::format("Obj_{:#x}", offset);
+				auto comment = ObjectToString(obj);
+				description = comment;
+			}
+		}
+		else if (objType == dart::ObjectPool::EntryType::kImmediate) {
+			name = std::format("IMM_{:#x}_{:#x}", pool.RawValueAt(i), offset);
+		}
+		else if (objType == dart::ObjectPool::EntryType::kNativeFunction) {
+			// the name of NativeFunction can be retrieved from dart::NativeSymbolResolver::LookupSymbolName
+			//   but normally flutter code never access it
+			// if we use the name, we should cache it because many Pool Objects reference same NativeFunction
+			name = std::format("NativeFn_{:#x}_{:#x}", pool.RawValueAt(i), offset);
+		}
+		else {
+			name = std::format("RAW_{:#x}_{:#x}", pool.RawValueAt(i), offset);
+		}
+
+		of << ",[" << offset << "," << Util::JsonQuote(name) << ","
+			<< Util::JsonQuote(description) << "]\n";
+	}
+
+	of << "]";
+}
+
+void DartDumper::dumpScriptOperands(std::ostream& of)
+{
+	Disassembler disassembler;
+	bool first = true;
+	for (auto lib : app.libs) {
+		if (lib->isInternal) continue;
+		for (auto cls : lib->classes) {
+			for (auto fn : cls->Functions()) {
+				if (!fn->PayloadSize()) continue;
+				auto insns = disassembler.Disasm(reinterpret_cast<const uint8_t*>(app.base() + fn->PayloadAddress()), fn->PayloadSize(), fn->PayloadAddress());
+				for (size_t i = 0; i < insns.Count(); ++i) {
+					auto insn = insns.At(i);
+					for (uint8_t j = 0; j < insn.op_count(); ++j) {
+						const auto base = insn.MemoryBase(j);
+						if (base != CSREG_DART_THR && base != CSREG_DART_PP) continue;
+						// Only constant base+displacement accesses can name a structure member.
+#if defined(TARGET_ARCH_X64)
+						const auto& x = insn.ptr()->detail->x86;
+						if (insn.ops[j].mem.index != X86_REG_INVALID || insn.ops[j].mem.segment != X86_REG_INVALID || x.addr_size != dart::kWordSize) continue;
+#elif defined(TARGET_ARCH_ARM)
+						if (insn.ptr()->detail->arm.writeback || insn.ops[j].mem.index != ARM_REG_INVALID) continue;
+#else
+						if (insn.ptr()->detail->arm64.writeback || insn.ops[j].mem.index != ARM64_REG_INVALID) continue;
+#endif
+						if (!first) of << ",\n";
+						first = false;
+						const bool pool = base == CSREG_DART_PP;
+						of << '[' << Util::JsonQuote(std::format("{:#x}", insn.address())) << ',' << static_cast<int>(j)
+							<< ',' << Util::JsonQuote(pool ? "DartObjectPool" : "DartThread") << ',' << (pool ? kPoolPointerTag : 0) << ']';
+						break;
+					}
+				}
+			}
+		}
+	}
+}
+
+void DartDumper::dumpScriptLayouts(std::ostream& of)
+{
+	of << "\"constants\":{";
+	of << "\"ClassIdTagPos\":" << kUntaggedObjectClassIdTagPos << ",\n";
+	of << "\"ClassIdTagMask\":" << ((1u << dart::UntaggedObject::kClassIdTagSize) - 1) << ",\n";
+
+	of << "\"NumPredefinedCids\":" << dart::kNumPredefinedCids << ",\n";
+	of << "\"CidObject\":" << dart::kInstanceCid << ",\n";
+	of << "\"CidNull\":" << dart::kNullCid << ",\n";
+	of << "\"CidSmi\":" << dart::kSmiCid << ",\n";
+	of << "\"CidMint\":" << dart::kMintCid << ",\n";
+	of << "\"CidDouble\":" << dart::kDoubleCid << ",\n";
+	of << "\"CidBool\":" << dart::kBoolCid << ",\n";
+	of << "\"CidString\":" << dart::kOneByteStringCid << ",\n";
+	of << "\"CidTwoByteString\":" << dart::kTwoByteStringCid << ",\n";
+	of << "\"CidArray\":" << dart::kArrayCid << ",\n";
+	of << "\"CidImmutableArray\":" << dart::kImmutableArrayCid << ",\n";
+	of << "\"CidConstMap\":" << dart::kConstMapCid << ",\n";
+	of << "\"CidConstSet\":" << dart::kConstSetCid << ",\n";
+	of << "\"CidGrowableArray\":" << dart::kGrowableObjectArrayCid << ",\n";
+	of << "\"CidSet\":" << dart::kSetCid << ",\n";
+	of << "\"CidMap\":" << dart::kMapCid << ",\n";
+	of << "\"CidClosure\":" << dart::kClosureCid << ",\n";
+	of << "\"CidUint8Array\":" << dart::kTypedDataUint8ArrayCid << ",\n";
+	of << "\"CidInt8Array\":" << dart::kTypedDataInt8ArrayCid << ",\n";
+	of << "\"CidUint16Array\":" << dart::kTypedDataUint16ArrayCid << ",\n";
+	of << "\"CidInt16Array\":" << dart::kTypedDataInt16ArrayCid << ",\n";
+	of << "\"CidUint32Array\":" << dart::kTypedDataUint32ArrayCid << ",\n";
+	of << "\"CidInt32Array\":" << dart::kTypedDataInt32ArrayCid << ",\n";
+	of << "\"CidUint64Array\":" << dart::kTypedDataUint64ArrayCid << ",\n";
+	of << "\"CidInt64Array\":" << dart::kTypedDataInt64ArrayCid << ",\n";
+	of << "\"CidFloat32Array\":" << dart::kTypedDataFloat32ArrayCid << ",\n";
+	of << "\"CidFloat64Array\":" << dart::kTypedDataFloat64ArrayCid << ",\n";
+	of << "\"CidContext\":" << dart::kContextCid << "},\n";
+
+	of << "\"classes\":[\n";
+	bool first = true;
+	for (auto dartCls : app.classes) {
+		if (!first) of << ",\n";
+		first = false;
+		if (!dartCls) {
+			of << "null";
+			continue;
+		}
+
+		if (dartCls->Id() < dart::kNumPredefinedCids) {
+			switch (dartCls->Id()) {
+			case dart::kBoolCid:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"bool\",";
+				// value_ offset in raw_object.h is inaccessible
+				of << "\"valOffset\":" << AOT_Instance_InstanceSize << "}";
+				break;
+			case dart::kMintCid:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"int\",";
+				of << "\"valOffset\":" << AOT_Mint_value_offset << "}";
+				break;
+			case dart::kDoubleCid:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"double\",";
+				of << "\"valOffset\":" << AOT_Double_value_offset << "}";
+				break;
+			case dart::kOneByteStringCid:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"String\",";
+				of << "\"lenOffset\":" << AOT_String_length_offset << ",";
+				of << "\"dataOffset\":" << AOT_OneByteString_data_offset << "}";
+				break;
+			case dart::kTwoByteStringCid:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"TwoByteString\",";
+				of << "\"lenOffset\":" << AOT_String_length_offset << ",";
+				of << "\"dataOffset\":" << AOT_TwoByteString_data_offset << "}";
+				break;
+			case dart::kArrayCid:
+			case dart::kImmutableArrayCid:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"List\",";
+				//dart::Array::kBytesPerElement is same as a compressed pointer size
+				of << "\"lenOffset\":" << AOT_Array_length_offset << ",";
+				of << "\"dataOffset\":" << AOT_Array_data_offset << ",";
+				of << "\"typeOffset\":" << AOT_Array_type_arguments_offset << "}";
+				break;
+			case dart::kGrowableObjectArrayCid:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"GrowableList\",";
+				of << "\"lenOffset\":" << AOT_GrowableObjectArray_length_offset << ",";
+				of << "\"dataOffset\":" << AOT_GrowableObjectArray_data_offset << ",";
+				of << "\"typeOffset\":" << AOT_GrowableObjectArray_type_arguments_offset << "}";
+				break;
+			case dart::kSetCid:
+#ifndef OLD_MAP_NO_IMMUTABLE
+			case dart::kConstSetCid:
+#endif
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"Set\",";
+				of << "\"usedOffset\":" << AOT_LinkedHashBase_used_data_offset << ",";
+				of << "\"delOffset\":" << AOT_LinkedHashBase_deleted_keys_offset << ",";
+				of << "\"dataOffset\":" << AOT_LinkedHashBase_data_offset << ",";
+				of << "\"typeOffset\":" << AOT_LinkedHashBase_type_arguments_offset << "}";
+				break;
+			case dart::kMapCid:
+#ifndef OLD_MAP_NO_IMMUTABLE
+			case dart::kConstMapCid:
+#endif
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"Map\",";
+				of << "\"usedOffset\":" << AOT_LinkedHashBase_used_data_offset << ",";
+				of << "\"delOffset\":" << AOT_LinkedHashBase_deleted_keys_offset << ",";
+				of << "\"dataOffset\":" << AOT_LinkedHashBase_data_offset << ",";
+				of << "\"typeOffset\":" << AOT_LinkedHashBase_type_arguments_offset << "}";
+				break;
+			case dart::kClosureCid:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"Closure\",";
+				of << "\"fnOffset\":" << AOT_Closure_function_offset << ",";
+				of << "\"contextOffset\":" << AOT_Closure_context_offset << ",";
+				of << "\"epOffset\":" << AOT_Closure_entry_point_offset << "}";
+				break;
+			case dart::kContextCid:
+				of << "{\"id\":" << dartCls->Id() << ",\"name\":\"Context\",\"countOffset\":" << AOT_Context_num_variables_offset
+					<< ",\"parentOffset\":" << AOT_Context_parent_offset << ",\"dataOffset\":" << AOT_Context_elements_start_offset << "}";
+				break;
+			case dart::kTypedDataFloat32ArrayCid:
+			case dart::kTypedDataFloat64ArrayCid:
+			case dart::kTypedDataUint8ArrayCid:
+			case dart::kTypedDataUint16ArrayCid:
+			case dart::kTypedDataUint32ArrayCid:
+			case dart::kTypedDataUint64ArrayCid:
+			case dart::kTypedDataInt8ArrayCid:
+			case dart::kTypedDataInt16ArrayCid:
+			case dart::kTypedDataInt32ArrayCid:
+			case dart::kTypedDataInt64ArrayCid:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":" << Util::JsonQuote(dartCls->Name()) << ",";
+				of << "\"lenOffset\":" << AOT_TypedDataBase_length_offset << ",";
+				// current version name is "AOT_TypedData_payload_offset" but old version name is "AOT_TypedData_data_offset"
+				// function from UntaggedTypedData is always same
+				of << "\"dataOffset\":" << dart::UntaggedTypedData::payload_offset() << "}";
+				break;
+			case dart::kInstanceCid:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":\"Object\",";
+				of << "\"size\":" << AOT_Instance_InstanceSize << "}";
+				break;
+			default:
+				of << "{\"id\":" << dartCls->Id() << ",";
+				of << "\"name\":" << Util::JsonQuote(dartCls->Name()) << "}";
+				break;
+			}
+		}
+		else {
+			of << "{";
+			of << "\"id\":" << dartCls->Id() << ",";
+			of << "\"name\":" << Util::JsonQuote(dartCls->Name()) << ",";
+			of << "\"fbitmap\":" << Util::JsonQuote(std::format("{:#x}", dartCls->FieldBitmap())) << ",";
+			of << "\"sid\":" << (dartCls->Parent() ? dartCls->Parent()->Id() : dart::kInstanceCid) << ",";
+			of << "\"size\":" << dartCls->Size() << ",";
+			of << "\"argOffset\":" << dartCls->TypeArgumentOffset();
+			dumpScriptClassFields(of, *dartCls);
+			of << "}";
+		}
+	}
+	of << "],\"topClasses\":[";
+	first = true;
+	for (auto cls : app.topClasses) {
+		if (!cls) continue;
+		if (!first) of << ',';
+		first = false;
+		of << "{\"id\":" << cls->Id() << ",\"name\":" << Util::JsonQuote(cls->Name());
+		dumpScriptClassFields(of, *cls);
+		of << '}';
+	}
+	of << ']';
+}
+
+void DartDumper::dumpScriptClassFields(std::ostream& of, DartClass& cls)
+{
+	std::ostringstream declaration;
+	cls.PrintHead(declaration);
+	of << ",\"declaration\":" << Util::JsonQuote(declaration.str())
+		<< ",\"library\":" << Util::JsonQuote(cls.Library().url) << ",\"fields\":[";
+	bool firstField = true;
+	for (auto field : cls.Fields()) {
+		if (!firstField) of << ',';
+		firstField = false;
+		of << "{\"offset\":" << field->Offset() << ",\"name\":" << Util::JsonQuote(field->Name())
+			<< ",\"type\":" << Util::JsonQuote(field->TypeName())
+			<< ",\"source\":" << Util::JsonQuote(field->Ptr() == nullptr ? "inferred" : "snapshot")
+			<< ",\"static\":" << (field->IsStatic() ? "true" : "false")
+			<< ",\"late\":" << (field->IsLate() ? "true" : "false")
+			<< ",\"final\":" << (field->IsFinal() ? "true" : "false")
+			<< ",\"const\":" << (field->IsConst() ? "true" : "false") << '}';
+	}
+	of << ']';
 }
 
 void DartDumper::Dump4Ida(std::filesystem::path outDir)

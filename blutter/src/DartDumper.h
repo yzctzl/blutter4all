@@ -7,6 +7,8 @@ class DartDumper
 public:
 	DartDumper(DartApp& app) : app(app) {};
 
+	void DumpScriptData(const std::filesystem::path& filename);
+
 	void Dump4Ida(std::filesystem::path outDir);
 
 	std::vector<std::pair<intptr_t, std::string>> DumpStructHeaderFile(std::string outFile);
@@ -23,6 +25,12 @@ private:
 
 	std::string dumpInstance(dart::Object& obj, bool simpleForm = false, bool nestedObj = false, int depth = 0);
 	std::string dumpInstanceFields(dart::Object& obj, DartClass& dartCls, intptr_t ptr, intptr_t offset, bool simpleForm = false, bool nestedObj = false, int depth = 0);
+
+	void dumpScriptLayouts(std::ostream& of);
+	void dumpScriptStructures(std::ostream& of);
+	void dumpScriptOperands(std::ostream& of);
+	void dumpScriptAnalysis(std::ostream& of);
+	void dumpScriptClassFields(std::ostream& of, DartClass& cls);
 
 	void applyStruct4Ida(std::ostream& of);
 

@@ -70,3 +70,19 @@ std::string Util::Unquote(const std::string& s)
 	ss >> std::quoted(result);
 	return result;
 }
+// JSON is also used as JavaScript data; escape every control character.
+std::string Util::JsonQuote(const std::string& s)
+{
+    std::string result = "\"";
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') {
+            result += '\\';
+            result += c;
+        }
+        else if (c < 0x20)
+            result += std::format("\\u{:04x}", c);
+        else
+            result += c;
+    }
+    return result + '"';
+}

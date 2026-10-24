@@ -1,19 +1,20 @@
 # blutter4all (b4a)
 
+English | [简体中文](README.zh-CN.md)
+
 A Dart AOT analysis tool for Flutter applications, based on
 [Blutter](https://github.com/worawit/blutter).
 
-Thanks to **Worawit Wangwarunyoo** and the original contributors for the foundation
-of this project. b4a builds on their work to expand architecture, platform and
+Thanks to [**Worawit Wangwarunyoo**](https://github.com/worawit) and the
+[original contributors](https://github.com/worawit/blutter/graphs/contributors)
+for the foundation of this project. b4a builds on their work to expand architecture, platform and
 script integration support. The original history and MIT license are preserved.
 
-Much of the new implementation was written with AI assistance. Its scope brings
-substantial review, compatibility testing and ongoing maintenance costs. Rather
-than submit this large set of changes upstream and ask the original maintainers
-to take on that burden, we chose to maintain b4a independently and take
-responsibility for its changes and issues. Focused fixes may still be offered
-upstream when appropriate. This is our maintenance decision, not a claim that the
-original project has rejected these changes.
+Much of the new code was written with AI assistance. Its correctness and stability
+have not been fully verified. These extensive changes require substantial review
+and maintenance, so we maintain b4a separately instead of submitting them upstream.
+We take responsibility for the added code and its issues. If you encounter a
+problem, [report it with your environment details and application sample](#issues).
 
 ## Features
 
@@ -31,8 +32,8 @@ original project has rejected these changes.
 
 - Library, class, field, object-pool and function information, annotated assembly,
   and heuristic instruction and parameter recovery.
-- Frida 17+ scripts for object inspection, function search, hooks and analysis queries.
-- IDA 9+ scripts for names, thread/pool structures, class layouts and analysis comments.
+- [Frida](https://frida.re/) 17+ scripts for object inspection, function search, hooks and analysis queries.
+- [IDA](https://hex-rays.com/ida-pro) 9+ scripts for names, thread/pool structures, class layouts and analysis comments.
 - APK, IPA, macOS app bundle/ZIP and extracted application directory input.
 
 PE AOT and arm64e are not supported. Analysis coverage varies by Dart version and
@@ -114,7 +115,6 @@ git pull --ff-only
 python b4a.py path/to/app.apk output --rebuild
 ```
 
-
 ## Output and scripts
 
 | Output | Contents |
@@ -150,10 +150,10 @@ python generate_scripts.py output/script_data.json
 
 ## Issues
 
-Open an Issue with your command and error log. For bugs, you must provide the
-application package (APK, IPA or desktop app archive), or the AOT binary
-(`libapp.so`, `app.so` or Mach-O `App`) and matching Flutter engine. Attach the
-files or a download link.
+[Open an Issue](../../issues/new) with your b4a commit, host OS/Python version,
+target OS/architecture, Dart version, command and error log. Include the application
+package (APK, IPA or desktop app archive), or the AOT binary (`libapp.so`, `app.so`
+or Mach-O `App`) and matching Flutter engine, as attachments or a download link.
 
 ## License
 

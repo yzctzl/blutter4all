@@ -42,7 +42,7 @@ public:
 		SETTER,
 	};
 	explicit DartFunction(DartClass& cls, const dart::FunctionPtr ptr);
-	// for creating naked code (only used for obfuscated app)
+	// Code whose Function metadata was discarded by the AOT precompiler.
 	explicit DartFunction(DartClass& cls, const dart::Code& code);
 	DartFunction() = delete;
 	DartFunction(const DartFunction&) = delete;
@@ -75,6 +75,9 @@ public:
 	bool IsClosure() const  { return is_closure; }
 	bool IsFfi() const      { return is_ffi; }
 	bool IsStatic() const   { return is_static; }
+	// Dart's implicit closure/FFI parameter is a closure object, not 'this'.
+	// Missing Function metadata proves neither a receiver nor a static declaration.
+	bool HasReceiver() const { return ptr != dart::Function::null() && !is_static && !is_closure && !is_ffi; }
 	bool IsConst() const    { return is_const; }
 	bool IsAbstract() const { return is_abstract; }
 	bool IsAsync() const    { return is_async; }

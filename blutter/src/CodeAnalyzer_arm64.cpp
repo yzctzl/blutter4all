@@ -151,8 +151,10 @@ public:
 
 	void asm2il();
 
-	// returns an instruction after the prologue
-	void handlePrologue(AsmIterator& insItr, uint64_t endPrologueAddr);
+	// Parameter evidence is separate from instruction-pattern coverage.
+	enum class ParameterSetup { Unobserved, Matched, Incomplete };
+	ParameterSetup handlePrologue(AsmIterator& insItr, uint64_t endPrologueAddr);
+	void finalizeParameters(ParameterSetup setup);
 	std::tuple<A64::Register, A64::Register> unboxParam(AsmIterator& insn, A64::Register expectedSrcReg = A64::Register{});
 	void handleFixedParameters(AsmIterator& insn, arm64_reg paramCntReg, int paramCnt = 0);
 	void handleOptionalPositionalParameters(AsmIterator& insn, arm64_reg optionalParamCntReg);
@@ -374,19 +376,22 @@ void FunctionAnalyzer::printInsnException(InsnException& e)
 {
 	std::cerr << "Analysis error at line " << e.location.line()
 		<< " `" << e.location.function_name() << "`: " << e.cond << '\n';
-	const uint64_t fn_addr = fnInfo->dartFn.Address();
-
-	auto ins = e.insn;
-	for (int i = 0; ins->address > fn_addr && i < 4; i++) {
-		--ins;
-	}
-	while (ins != e.insn) {
+	const auto end = asm_insns.LastPtr() + 1;
+	const auto current = std::lower_bound(asm_insns.FirstPtr(), end, e.insn->address,
+		[](const cs_insn& insn, uint64_t address) { return insn.address < address; });
+	auto ins = current - std::min<ptrdiff_t>(4, current - asm_insns.FirstPtr());
+	while (ins != current) {
 		std::cerr << std::format("    {:#x}: {} {}\n", ins->address, &ins->mnemonic[0], &ins->op_str[0]);
 		++ins;
 	}
+	// A matcher can fail on AsmIterator's end sentinel, which is not part of
+	// Capstone's allocation. Never walk it as an instruction-array pointer.
+	if (ins == end) {
+		std::cerr << std::format("  * {:#x}: <end of function>\n", e.insn->address);
+		return;
+	}
 	std::cerr << std::format("  * {:#x}: {} {}\n", ins->address, &ins->mnemonic[0], &ins->op_str[0]);
-	if (ins->address + ins->size < fnInfo->dartFn.AddressEnd()) {
-		++ins;
+	if (++ins != end) {
 		std::cerr << std::format("    {:#x}: {} {}\n", ins->address, &ins->mnemonic[0], &ins->op_str[0]);
 	}
 }
@@ -394,8 +399,8 @@ void FunctionAnalyzer::printInsnException(InsnException& e)
 std::unique_ptr<EnterFrameInstr> FunctionAnalyzer::processEnterFrameInstr(AsmIterator& insn)
 {
 	if (insn.id() == ARM64_INS_STP && insn.ops(0).reg == CSREG_DART_FP && insn.ops(1).reg == ARM64_REG_LR && insn.ops(2).mem.base == CSREG_DART_SP) {
+		InsnMarker marker(insn);
 		INSN_ASSERT(insn.writeback());
-		const auto ins0_addr = insn.address();
 		++insn;
 
 		INSN_ASSERT(insn.id() == ARM64_INS_MOV);
@@ -404,7 +409,7 @@ std::unique_ptr<EnterFrameInstr> FunctionAnalyzer::processEnterFrameInstr(AsmIte
 		++insn;
 
 		fnInfo->useFramePointer = true;
-		return std::make_unique<EnterFrameInstr>(insn.Wrap(ins0_addr));
+		return std::make_unique<EnterFrameInstr>(insn.Wrap(marker.Take()));
 	}
 	return nullptr;
 }
@@ -438,41 +443,42 @@ std::unique_ptr<AllocateStackInstr> FunctionAnalyzer::processAllocateStackInstr(
 std::unique_ptr<CheckStackOverflowInstr> FunctionAnalyzer::processCheckStackOverflowInstr(AsmIterator& insn)
 {
 	if (insn.id() == ARM64_INS_LDR && insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == AOT_Thread_stack_limit_offset) {
+		InsnMarker marker(insn);
 		INSN_ASSERT(insn.ops(0).reg == CSREG_DART_TMP);
-		const auto ins0_addr = insn.address();
 		++insn;
 
 		// cmp SP, TMP
-INSN_ASSERT(insn.id() == ARM64_INS_CMP);
-INSN_ASSERT(insn.ops(0).reg == CSREG_DART_SP);
-INSN_ASSERT(insn.ops(1).reg == CSREG_DART_TMP);
-++insn;
+		INSN_ASSERT(insn.id() == ARM64_INS_CMP);
+		INSN_ASSERT(insn.ops(0).reg == CSREG_DART_SP);
+		INSN_ASSERT(insn.ops(1).reg == CSREG_DART_TMP);
+		++insn;
 
-INSN_ASSERT(insn.id() == ARM64_INS_B);
-INSN_ASSERT(insn.ops(0).type == ARM64_OP_IMM);
-uint64_t target = (uint64_t)insn.ops(0).imm;
-const auto cc = insn.cc();
-++insn;
+		INSN_ASSERT(insn.id() == ARM64_INS_B);
+		INSN_ASSERT(insn.ops(0).type == ARM64_OP_IMM);
+		uint64_t target = (uint64_t)insn.ops(0).imm;
+		const auto cc = insn.cc();
+		++insn;
 
-if (cc == ARM64_CC_HI) {
-	INSN_ASSERT(insn.IsBranch());
-	INSN_ASSERT(insn.NextAddress() == target);
-	target = (uint64_t)insn.ops(0).imm;
-	++insn;
-}
-else {
-	// b.ls #overflow_target
-	INSN_ASSERT(cc == ARM64_CC_LS);
-	//FATAL("unexpect branch condition for CheckStackOverflow");
-}
+		if (cc == ARM64_CC_HI) {
+			INSN_ASSERT(insn.IsBranch());
+			INSN_ASSERT(insn.NextAddress() == target);
+			target = (uint64_t)insn.ops(0).imm;
+			++insn;
+		}
+		else {
+			// b.ls #overflow_target
+			INSN_ASSERT(cc == ARM64_CC_LS);
+			//FATAL("unexpect branch condition for CheckStackOverflow");
+		}
 
-if (target != 0) {
-	// the dart compiler always put slow path at the end of function after "ret"
-	INSN_ASSERT(target < dartFn->AddressEnd() && target >= insn.address());
-	if (fnInfo->firstCheckStackOverflowAddr == 0)
-		fnInfo->firstCheckStackOverflowAddr = ins0_addr;
-	return std::make_unique<CheckStackOverflowInstr>(insn.Wrap(ins0_addr), target);
-}
+		if (target != 0) {
+			// the dart compiler always put slow path at the end of function after "ret"
+			INSN_ASSERT(target < dartFn->AddressEnd() && target >= insn.address());
+			const auto ins0_addr = marker.Take();
+			if (fnInfo->firstCheckStackOverflowAddr == 0)
+				fnInfo->firstCheckStackOverflowAddr = ins0_addr;
+			return std::make_unique<CheckStackOverflowInstr>(insn.Wrap(ins0_addr), target);
+		}
 	}
 
 	return nullptr;
@@ -716,14 +722,14 @@ StoreLocalResult FunctionAnalyzer::handleStoreLocal(AsmIterator& insn, arm64_reg
 	return StoreLocalResult{ srcReg, offset };
 }
 
-void FunctionAnalyzer::handlePrologue(AsmIterator& insn, uint64_t endPrologueAddr)
+FunctionAnalyzer::ParameterSetup FunctionAnalyzer::handlePrologue(AsmIterator& insn, uint64_t endPrologueAddr)
 {
 	{
 		auto ilEnter = processEnterFrameInstr(insn);
 		if (!ilEnter) {
 			// no EnterFrame at a beginning of function. likely to be leaf function.
 			// TODO:
-			return;
+			return ParameterSetup::Unobserved;
 		}
 		fnInfo->AddIL(std::move(ilEnter));
 	}
@@ -732,12 +738,12 @@ void FunctionAnalyzer::handlePrologue(AsmIterator& insn, uint64_t endPrologueAdd
 		auto ilAlloc = processAllocateStackInstr(insn);
 		if (!ilAlloc) {
 			// no local variable (very rare)
-			return;
+			return ParameterSetup::Unobserved;
 		}
 		fnInfo->AddIL(std::move(ilAlloc));
 	}
 
-	bool hasPrologue = false;
+	auto setup = ParameterSetup::Unobserved;
 #ifdef HAS_INIT_ASYNC
 	if (fnInfo->stackSize) {
 		// prologue for processing function arguments
@@ -746,7 +752,7 @@ void FunctionAnalyzer::handlePrologue(AsmIterator& insn, uint64_t endPrologueAdd
 		try {
 			auto il = processPrologueParametersInstr(insn, endPrologueAddr);
 			if (il) {
-				hasPrologue = true;
+				setup = ParameterSetup::Matched;
 				// Initializers may be interleaved with parameter setup. Emit them
 				// in address order, splitting setup rather than covering bytes twice.
 				auto next = il->Start();
@@ -764,6 +770,7 @@ void FunctionAnalyzer::handlePrologue(AsmIterator& insn, uint64_t endPrologueAdd
 			}
 		}
 		catch (InsnException& e) {
+			setup = ParameterSetup::Incomplete;
 			printInsnException(e);
 		}
 		fnInfo->DestroyState();
@@ -771,9 +778,10 @@ void FunctionAnalyzer::handlePrologue(AsmIterator& insn, uint64_t endPrologueAdd
 	}
 #endif
 
-	// below check is very useful for checking analyzing prologue because it is correct in most case
-	if (hasPrologue && endPrologueAddr != 0 && endPrologueAddr != insn.address()) {
-		//std::cerr << std::format("endPrologueAddr != insn.address(), {:#x} != {:#x}\n", endPrologueAddr, insn.address());
+	// Consuming some parameter loads does not prove the whole entry protocol.
+	if (setup == ParameterSetup::Matched) {
+		if (!endPrologueAddr || endPrologueAddr != insn.address())
+			setup = ParameterSetup::Incomplete;
 	}
 
 	// Dart always check stack overflow if allocating stack instruction is emitted
@@ -781,6 +789,51 @@ void FunctionAnalyzer::handlePrologue(AsmIterator& insn, uint64_t endPrologueAdd
 	if (ilStack) {
 		fnInfo->AddIL(std::move(ilStack));
 	}
+	return setup;
+}
+
+void FunctionAnalyzer::finalizeParameters(ParameterSetup setup)
+{
+	auto& params = fnInfo->params;
+	params.isPartial = true;
+	if (dartFn->Ptr() == dart::Function::null() || setup == ParameterSetup::Incomplete)
+		return;
+	if (dartFn->IsFfi())
+		return; // Dart entry patterns do not prove the native callback ABI.
+	const auto& function = dart::Function::Handle(dartFn->Ptr());
+	const auto signaturePtr = function.signature();
+	if (!signaturePtr.IsHeapObject())
+		return;
+	const auto& signature = dart::FunctionType::Handle(signaturePtr);
+	const bool accessor = dartFn->Kind() == DartFunction::GETTER || dartFn->Kind() == DartFunction::SETTER;
+	if (signature.IsNull() && !accessor)
+		return;
+	// Accessor arity survives a trimmed signature. Ordinary functions require
+	// their declaration; neither stack offsets nor register copies prove arity.
+	const auto count = signature.IsNull() ? function.NumImplicitParameters() +
+		(dartFn->Kind() == DartFunction::SETTER) : function.NumParameters();
+	const auto fixed = signature.IsNull() ? count : function.num_fixed_parameters();
+	const bool named = !signature.IsNull() && function.HasOptionalNamedParameters();
+	if (params.NumParam() != count || params.numFixedParam != fixed || params.isNamedParam != named)
+		return;
+	// A known zero-argument leaf needs no parameter-copy protocol.
+	if (count && setup != ParameterSetup::Matched)
+		return;
+	for (int i = 0; i < count; ++i) {
+		const auto& param = params[i];
+		if (!param.valReg.IsSet() && !param.localOffset && !param.paramReg.IsSet())
+			return;
+		if (i < fixed)
+			continue;
+		if (dartFn->NumParam() != count)
+			return;
+		const auto& declaration = dartFn->Param(i);
+		if (named && param.name != declaration.name)
+			return;
+		if (!declaration.isRequired && !param.val)
+			return;
+	}
+	params.isPartial = false;
 }
 
 enum FunctionVarTypeId : int32_t {
@@ -863,7 +916,7 @@ void FunctionAnalyzer::handleFixedParameters(AsmIterator& insn, arm64_reg paramC
 	fnInfo->params.numFixedParam = fnInfo->params.NumParam();
 	// TODO:
 	// there is a case a function cannot matching pattern. so num fixed param is 0 even it is not
-	if (!dartFn->IsStatic() && fnInfo->params.numFixedParam > 0) {
+	if (dartFn->HasReceiver() && fnInfo->params.numFixedParam > 0) {
 		// class method. first parameter is "this"
 		fnInfo->params[0].name = "this";
 		fnInfo->params[0].type = dartFn->Class().DeclarationType(); // TODO: class with type arguments (generic class)
@@ -1701,7 +1754,7 @@ void FunctionAnalyzer::handleParameterRegisters(AsmIterator& insn)
 			fnInfo->params.addFixedParam(FnParamInfo{ tmpParam.reg, tmpParam.dstReg, tmpParam.localOffset });
 		}
 
-		if (!dartFn->IsStatic() && paramRegs[0].reg == A64::Register::R1) {
+		if (dartFn->HasReceiver() && paramRegs[0].reg == A64::Register::R1) {
 			// class method. first parameter is "this"
 			fnInfo->params[0].name = "this";
 			fnInfo->params[0].type = dartFn->Class().DeclarationType(); // TODO: class with type arguments (generic class)
@@ -3549,7 +3602,14 @@ void FunctionAnalyzer::asm2il()
 {
 	AsmIterator insn(asm_insns.FirstPtr(), asm_insns.LastPtr());
 
-	handlePrologue(insn, fnInfo->asmTexts.FirstStackLimitAddress());
+	auto setup = ParameterSetup::Incomplete;
+	try {
+		setup = handlePrologue(insn, fnInfo->asmTexts.FirstStackLimitAddress());
+	}
+	catch (InsnException& e) {
+		printInsnException(e);
+	}
+	finalizeParameters(setup);
 
 	do {
 		bool ok = false;

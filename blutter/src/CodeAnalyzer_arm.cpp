@@ -2214,8 +2214,11 @@ void ArmParameterRecovery::Recover()
 	}
 	if (inferredDeclaration && std::none_of(fn.data.params.params.begin(),
 								   fn.data.params.params.end(),
-								   [](const FnParamInfo& parameter) { return bool(parameter.val); }))
+								   [](const FnParamInfo& parameter) { return bool(parameter.val); })) {
 		fn.data.params = FnParams{};
+		// An empty result does not prove a zero-argument declaration.
+		fn.data.params.isPartial = true;
+	}
 	if (fn.data.params.empty())
 		ranges.clear();
 	ranges.insert(ranges.end(), typeArgumentRanges.begin(), typeArgumentRanges.end());
@@ -2277,7 +2280,7 @@ void FunctionAnalyzer::recoverParameters()
 			if (declaration.type && declaration.type->IsType())
 				parameter.type = declaration.type->AsType();
 		}
-		if (!function.IsStatic() && !function.IsClosure() && i == 0) {
+		if (function.HasReceiver() && i == 0) {
 			parameter.name = "this";
 			parameter.type = function.Class().DeclarationType();
 		}

@@ -167,7 +167,8 @@ std::string DartFunction::ToCallStatement(const std::vector<std::shared_ptr<VarI
 {
 	std::string callArgs = "";
 	std::string callFn = "";
-	if (IsStatic() || kind == CONSTRUCTOR) {
+	// With no declaration, preserve all arguments instead of inventing a receiver.
+	if (ptr == dart::Function::null() || IsStatic() || kind == CONSTRUCTOR) {
 		if (!args.empty()) {
 			callArgs = std::accumulate(args.begin() + 1, args.end(), args[0]->CallArgName(),
 				[](std::string x, const std::shared_ptr<VarItem> y) {

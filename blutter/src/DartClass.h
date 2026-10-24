@@ -14,7 +14,7 @@ public:
 		ENUM,     // enum (parent class is _Enum)
 	};
 	explicit DartClass(const DartLibrary& lib, const dart::Class& cls);
-	// for creating dummy class (only used for obfuscated app)
+	// Container for Code without surviving class metadata.
 	explicit DartClass(const DartLibrary& lib);
 	DartClass() = delete;
 	DartClass(const DartClass&) = delete;

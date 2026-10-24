@@ -2409,7 +2409,7 @@ void X64ParameterRecovery::seedIncoming(Registers& registers)
 			registerConvention = false;
 	}
 	if (registerConvention) {
-		if (!function.IsStatic())
+		if (function.HasReceiver())
 			receiver = Reg{dart::DartCallingConvention::kCpuRegistersForArgs[0]};
 		auto addRegister = [&](Reg reg) {
 			FnParamInfo info;
@@ -2436,7 +2436,7 @@ void X64ParameterRecovery::signature()
 	if (sig.IsNull() && !accessor) {
 		// NumImplicitParameters proves the receiver declaration even when no
 		// entry copy survives. It does not prove a complete regular signature.
-		if (vmFunction.IsRegularFunction() && !function.IsStatic() && !function.IsClosure()) {
+		if (vmFunction.IsRegularFunction() && function.HasReceiver()) {
 			FnParamInfo parameter{"this"};
 			parameter.type = function.Class().DeclarationType();
 			receiverParameter = data.params.NumParam();
@@ -2463,7 +2463,7 @@ void X64ParameterRecovery::signature()
 			if (declaration.type && declaration.type->IsType())
 				parameter.type = declaration.type->AsType();
 		}
-		if (!function.IsStatic() && !function.IsClosure() && i == 0) {
+		if (function.HasReceiver() && i == 0) {
 			parameter.name = "this";
 			parameter.type = function.Class().DeclarationType();
 		}

@@ -522,7 +522,7 @@ void DartApp::findFunctionInHeap()
 			addFunction(ep_offset, dart::Function::Cast(obj));
 		}
 		else if (obj.IsSmi()) {
-			// this case is only seen in obfuscated app
+			// The AOT precompiler can discard the Function and retain only its CID.
 			auto ownerClassId = code.OwnerClassId();
 			ASSERT(ownerClassId == dart::kFunctionCid);
 			if (!functions.contains(ep_offset)) {
@@ -530,7 +530,7 @@ void DartApp::findFunctionInHeap()
 				// without treating VM native classes as application libraries.
 				if (!recoveredLib) {
 					recoveredLib = new DartLibrary(0xdeadead);
-					recoveredLib->url = "b4a:recovered";
+					recoveredLib->url = "b4a_recovered";
 					recoveredLib->name = "Recovered code";
 					recoveredLib->isInternal = false;
 					recoveredLib->topClass = new DartClass(*recoveredLib);

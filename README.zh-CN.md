@@ -4,6 +4,8 @@
 
 基于 [Blutter](https://github.com/worawit/blutter) 的 Flutter Dart AOT 分析工具。
 
+**目前不支持混淆应用。**
+
 感谢 [**Worawit Wangwarunyoo**](https://github.com/worawit) 和
 [原项目贡献者](https://github.com/worawit/blutter/graphs/contributors) 奠定的基础。
 b4a 在此基础上扩展架构、平台和脚本集成支持，保留原始提交历史和 MIT 许可证。

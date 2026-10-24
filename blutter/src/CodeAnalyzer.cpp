@@ -146,6 +146,8 @@ VarValue* getPoolObject(DartApp& app, intptr_t offset, CpuRegister dstReg)
 AnalyzedFnData::AnalyzedFnData(DartApp& app, DartFunction& dartFn, AsmTexts asmTexts)
 	: app(app), dartFn(dartFn), asmTexts(std::move(asmTexts))
 {
+	// Without a declaration, observed entry loads cannot prove unused parameters.
+	params.isPartial = dartFn.Ptr() == dart::Function::null();
 }
 
 void CodeAnalyzer::AnalyzeAll()

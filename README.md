@@ -5,6 +5,8 @@ English | [简体中文](README.zh-CN.md)
 A Dart AOT analysis tool for Flutter applications, based on
 [Blutter](https://github.com/worawit/blutter).
 
+**Obfuscated applications are currently not supported.**
+
 Thanks to [**Worawit Wangwarunyoo**](https://github.com/worawit) and the
 [original contributors](https://github.com/worawit/blutter/graphs/contributors)
 for the foundation of this project. b4a builds on their work to expand architecture, platform and

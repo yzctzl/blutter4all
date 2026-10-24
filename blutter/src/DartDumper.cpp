@@ -163,9 +163,11 @@ void DartDumper::DumpScriptData(const std::filesystem::path& filename)
 		};
 		for (auto lib : app.libs) {
 			for (auto cls : lib->classes) {
+				const auto owner = cls->Ptr() == dart::Class::null() ? lib->GetName()
+					: std::format("{}_{}", lib->GetName(), cls->Name());
 				for (auto fn : cls->Functions()) {
 					const auto address = fn->Address();
-					const auto name = std::format("{}_{}::{}_{:x}", lib->GetName(), cls->Name(), getFunctionName4Ida(*fn, cls->Name()), address);
+					const auto name = std::format("{}::{}_{:x}", owner, getFunctionName4Ida(*fn, cls->Name()), address);
 					function(address, fn->Size(), name);
 					if (fn->HasMorphicCode()) {
 						const auto payload = fn->PayloadAddress();

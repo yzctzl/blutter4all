@@ -55,15 +55,16 @@ endif()
 set(SRCDIR "src")
 include(sourcelist.cmake)
 list(TRANSFORM SRCS PREPEND "${SRCDIR}/")
-add_executable(${BINNAME} ${SRCS})
+add_executable(${PROJECT_NAME} ${SRCS})
+set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${BINNAME}")
 
-target_link_libraries(${BINNAME} PRIVATE ${DARTLIB} capstone)
+target_link_libraries(${PROJECT_NAME} PRIVATE ${DARTLIB} capstone)
 
-target_precompile_headers(${BINNAME} PRIVATE "${SRCDIR}/pch.h")
+target_precompile_headers(${PROJECT_NAME} PRIVATE "${SRCDIR}/pch.h")
 
 if (MSVC)
 	# for dynamic function (exception) table
-	target_link_libraries(${BINNAME} PRIVATE ntdll)
+	target_link_libraries(${PROJECT_NAME} PRIVATE ntdll)
 	# remove compiler exception handler options
 	#string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 	# remove compiler RTTI option
@@ -72,12 +73,12 @@ if (MSVC)
 	if (CMAKE_GENERATOR MATCHES "Visual Studio")
 		# use SEMIDBG for enabling ASSERT macro while linking against release build of Dart VM
 		set(cc_opts /GR- /MD /D SEMIDBG)
-		set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${BINNAME})
-		set_target_properties(${BINNAME} PROPERTIES VS_DEBUGGER_COMMAND_ARGUMENTS "${DBG_CMD}")
+		set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
+		set_target_properties(${PROJECT_NAME} PROPERTIES VS_DEBUGGER_COMMAND_ARGUMENTS "${DBG_CMD}")
 	else()
 		# assume Ninja
 		set(cc_opts /Oy /GR- /sdl- /Oi /GL /Gy /Zc:wchar_t /Zc:inline)
-		target_link_options(${BINNAME} PRIVATE /LTCG /OPT:REF /OPT:ICF)
+		target_link_options(${PROJECT_NAME} PRIVATE /LTCG /OPT:REF /OPT:ICF)
 	endif()
 else()
 	# TODO: gcc options to remove dead code in static dartvm library
@@ -120,9 +121,9 @@ endif()
 if (UNIFORM_INTEGER_ACCESS)
 	set(defines ${defines} UNIFORM_INTEGER_ACCESS)
 endif()
-target_compile_definitions(${BINNAME} PRIVATE ${defines})
+target_compile_definitions(${PROJECT_NAME} PRIVATE ${defines})
 
-target_compile_options(${BINNAME} PRIVATE ${cc_opts})
+target_compile_options(${PROJECT_NAME} PRIVATE ${cc_opts})
 
 cmake_path(SET DST_DIR NORMALIZE "${PROJECT_SOURCE_DIR}/../bin")
-install (TARGETS ${BINNAME} RUNTIME DESTINATION ${DST_DIR})
+install (TARGETS ${PROJECT_NAME} RUNTIME DESTINATION ${DST_DIR})

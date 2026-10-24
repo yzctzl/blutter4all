@@ -51,7 +51,8 @@ class DartLibInfo:
         if snapshot_hash is not None:
             if re.fullmatch(r'[0-9a-f]{32}', snapshot_hash) is None:
                 raise ValueError('Invalid Dart snapshot hash')
-            self.lib_name += '_snapshot-' + snapshot_hash
+            # A 64-bit prefix keeps build paths short; version.cc uses the full hash.
+            self.lib_name += '_snapshot-' + snapshot_hash[:16]
 
 
 def checkout_dart(info: DartLibInfo):

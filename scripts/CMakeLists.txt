@@ -63,7 +63,8 @@ if (SNAPSHOT_HASH)
 	if (NOT snapshot_hash_length EQUAL 32 OR NOT SNAPSHOT_HASH MATCHES "^[0-9a-f]+$")
 		message(FATAL_ERROR "Invalid Dart snapshot hash")
 	endif()
-	string(APPEND LIBNAME "_snapshot-${SNAPSHOT_HASH}")
+	string(SUBSTRING "${SNAPSHOT_HASH}" 0 16 snapshot_key)
+	string(APPEND LIBNAME "_snapshot-${snapshot_key}")
 endif()
 
 set(CMAKE_DEBUG_POSTFIX "_d")
@@ -74,9 +75,11 @@ if (VERSION_FILE)
 	list(FILTER SRCS EXCLUDE REGEX "(^|/)vm/version\\.cc$")
 	list(APPEND SRCS "${VERSION_FILE}")
 endif()
-add_library(${LIBNAME} STATIC ${SRCS})
+add_library(dartvm STATIC ${SRCS})
+# Preserve the public package identity; object directories use a short target.
+set_target_properties(dartvm PROPERTIES OUTPUT_NAME "${LIBNAME}" EXPORT_NAME "${LIBNAME}")
 
-set_target_properties(${LIBNAME} PROPERTIES
+set_target_properties(dartvm PROPERTIES
 	CXX_STANDARD CXX_STD_PLACE_HOLDER
 	CXX_STANDARD_REQUIRED True
 	CXX_VISIBILITY_PRESET hidden
@@ -138,20 +141,20 @@ else()
 	)
 endif()
 
-target_compile_definitions(${LIBNAME} PUBLIC ${defines})
+target_compile_definitions(dartvm PUBLIC ${defines})
 
-target_compile_options(${LIBNAME} PRIVATE ${cc_opts})
+target_compile_options(dartvm PRIVATE ${cc_opts})
  
-target_include_directories(${LIBNAME} PRIVATE "${SRCDIR}" "${ICU_INCLUDE_DIRS}")
-target_include_directories(${LIBNAME} INTERFACE
+target_include_directories(dartvm PRIVATE "${SRCDIR}" "${ICU_INCLUDE_DIRS}")
+target_include_directories(dartvm INTERFACE
 							$<BUILD_INTERFACE:${SRCDIR}>
 							$<INSTALL_INTERFACE:include/${PROJECT_NAME}>
 						)
 
 if (MSVC)
-	target_link_libraries(${LIBNAME} PUBLIC ${ICU_LIBRARIES})
+	target_link_libraries(dartvm PUBLIC ${ICU_LIBRARIES})
 else()
-	target_link_libraries(${LIBNAME} PUBLIC dl pthread ${ICU_LIBRARIES})
+	target_link_libraries(dartvm PUBLIC dl pthread ${ICU_LIBRARIES})
 endif()
 
 # install lib
@@ -159,7 +162,7 @@ set(CMAKE_INSTALL_MESSAGE LAZY)
 # export name MUST be same as Config.cmake.in that is generated from dartvm_fetch_build.py
 set(EXPORT_NAME "dartvmTarget")
 
-install(TARGETS ${LIBNAME}
+install(TARGETS dartvm
 	EXPORT "${EXPORT_NAME}"
 	DESTINATION lib
 )

@@ -9,10 +9,6 @@ public:
 
 	void DumpScriptData(const std::filesystem::path& filename);
 
-	void Dump4Ida(std::filesystem::path outDir);
-
-	std::vector<std::pair<intptr_t, std::string>> DumpStructHeaderFile(std::string outFile);
-
 	void DumpCode(const char* out_dir);
 
 	void DumpObjectPool(const char* filename);
@@ -31,8 +27,6 @@ private:
 	void dumpScriptOperands(std::ostream& of);
 	void dumpScriptAnalysis(std::ostream& of);
 	void dumpScriptClassFields(std::ostream& of, DartClass& cls);
-
-	void applyStruct4Ida(std::ostream& of);
 
 	const std::string& getQuoteString(dart::Object& obj);
 

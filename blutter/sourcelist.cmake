@@ -29,8 +29,6 @@ set(SRCS
     MachOHelper.cpp
     ObjectPool.h
     MachOHelper.h
-    FridaWriter.cpp
-    FridaWriter.h
     HtArrayIterator.h
     Util.cpp
     Util.h

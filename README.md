@@ -1,7 +1,8 @@
 # B(l)utter
 Flutter Mobile Application Reverse Engineering Tool by Compiling Dart AOT Runtime
 
-Currently the application supports only Android libapp.so (arm64 only).
+Supports Dart AOT snapshots in ELF and Mach-O format for ARM64/x64,
+and Android ARMv7 ELF snapshots. See the target notes below.
 Also the application is currently work only against recent Dart versions.
 
 For high priority missing features, see [TODO](#todo)
@@ -135,8 +136,8 @@ The shared snapshot pipeline exports libraries, classes, fields, objects and
 methods. The x64 analyzer recognizes frames, stack checks, pool/thread loads,
 calls, static fields, class IDs, integer unboxing, and object/array accesses
 where the base type is known. Other instructions retain their original assembly;
-ARM64 pattern coverage is broader. The Frida template currently requires ARM64
-with compressed pointers. Real Windows/Linux ELF and macOS universal Mach-O
+ARM64 pattern coverage is broader. Script integration is described below.
+Real Windows/Linux ELF and macOS universal Mach-O
 samples, Android x64 (Dart 3.10.8), and Linux ARM64 (Dart 3.5.4) have been
 exercised on a Linux x64 host; native Windows/macOS host
 builds have not been validated for this change.
@@ -165,3 +166,111 @@ and matching 32-bit ICU and Capstone libraries must be available. A custom
 on Linux x64 with Dart 2.19.6 and 3.10.8 ARMv7 samples; other host platforms
 have not been runtime-validated. Modern macOS cannot run this
 32-bit executable. ARM32 Mach-O and Thumb code are not supported.
+
+### Frida and IDA integration
+
+`blutter.py` exports SDK-derived metadata to `script_data.json` and renders:
+
+- `blutter_frida.js` for Frida **17+**.
+- `ida_script/addNames.py` and `ida_dart_struct.h` for IDA **9+**.
+- `script_analysis.jsonl`, the shared full analysis companion; keep it next to the scripts.
+
+The same templates handle Android ARM/ARM64/x64 ELF, Linux ARM64/x64 ELF,
+Windows x64 ELF, macOS ARM64/x64 Mach-O, and iOS ARM64 Mach-O. Object-slot and
+machine-word widths come from the snapshot build, including pointer compression.
+PE AOT and arm64e remain deferred.
+
+For Frida, edit `Config.hooks` near the top of the generated script. Hooks are
+empty by default. Inside a hook, use `new DartReader(this.context)` and
+`readRegister(name)` or `readStackSlot(index)` to inspect a **full tagged Dart
+object** at a known location. Stack slot 0 means the last physical stack argument
+at function entry; on x64 it skips the return address. This is not declaration
+parameter order, and unboxed values must not be interpreted as tagged objects.
+Object traversal is bounded; unsupported objects and unreadable fields are
+reported explicitly. Unknown native fields are shown as raw storage.
+
+System-loaded modules are matched against generated code fingerprints, without
+assuming a fixed module name. For self-mapped desktop ELF, set `Config.imageBase`
+or the runtime `_kDartIsolateSnapshotInstructions` address in
+`Config.isolateInstructions`. These refer to target virtual addresses, not file
+offsets. The script verifies the image before attaching hooks; automatic discovery
+of anonymous ELF mappings is not implemented. No Java/ObjC bridge is required.
+
+For IDA, open the matching AOT binary and run `ida_script/addNames.py`. Addresses
+are translated using the IDB image base; set `IMAGE_BASE` for a manually mapped
+image. The script checks processor, bitness, byte order and code fingerprints
+before changing the database. Existing user names, operand formats and conflicting
+structures are preserved. Type import errors are reported separately from function
+naming. These imports do not reconstruct complete decompiler function prototypes.
+
+Frida exposes `BlutterAPI.findFunctions(query)`, `functionInfo(offsetOrExactName)`,
+`analysis(offsetOrExactName)` and `hook(offsetOrExactName, callbacks)`. Custom
+objects use recovered field names where available. `BlutterAPI.metadata` contains
+class declarations, fields, types, flags and their snapshot/inferred provenance.
+Closures show their entry and captured context; native numeric fields are decoded
+only when both the declaration and storage bitmap establish the representation.
+
+Full function bodies include declaration/signature information, recovered and
+observed parameters, frame size, closure/type-argument locations, every IL record
+(including unknown ranges), and resolved call/constant/THR/PP annotations.
+They stay on the host and are requested individually; the application does not
+need to hold the entire analysis in memory. Install the optional `frida` Python
+package (17+) and use the shared host instead of the ordinary Frida CLI when
+requesting full analysis:
+
+```sh
+python generate_scripts.py output/script_data.json --attach PID_OR_NAME
+# For a remote/USB device, add --device DEVICE_ID.
+# --script custom.js loads a customized generated script.
+```
+
+For example, append this to the generated script (replace the offset):
+
+```js
+(async () => {
+    const info = await BlutterAPI.analysis('0x123456');
+    console.log(JSON.stringify(info.analysis));
+    BlutterAPI.hook(info.offset, {
+        onEnter() {
+            const reader = new BlutterAPI.DartReader(this.context);
+            console.log(JSON.stringify(reader.readParameters(info)));
+        }
+    });
+})().catch(console.error);
+```
+
+`readParameters` returns observed raw entry locations, with explicit unavailable
+markers. It does not interpret unknown tagged/unboxed representations or invent
+parameter order. Shared machine-code entries preserve all declaration aliases;
+`readParameters(info, index)` selects one explicitly (0 is the primary declaration).
+`await BlutterAPI.lookup('structures')` exposes the SDK thread
+and object-pool layouts; `lookup('operands')` exposes instruction operand records.
+The ordinary `frida -l` workflow still supports objects, function search and
+explicit hooks, but on-demand analysis requires the Python host.
+
+IDA additionally imports per-CID class layouts, declaration/parameter/frame
+summaries as function comments, and recognized IL plus resolved constants/calls
+as instruction comments. Generated comment blocks are replaced on reruns while
+preserving user text. Class members use physical slot widths, not guessed native
+C pointer types. Existing layouts and function boundaries are preserved; conflicts
+are reported. Set `IMPORT_CLASSES` or `IMPORT_ANALYSIS` to false to skip either
+pass. Keep `script_analysis.jsonl` one directory above `ida_script/addNames.py`.
+IDA imports the companion sequentially instead of embedding millions of Python
+objects in the generated source.
+
+The intermediate `script_data.json` is needed for regeneration. After editing templates, regenerate
+without rerunning analysis:
+
+```sh
+python generate_scripts.py output/script_data.json
+```
+
+Direct execution of the C++ binary exports metadata; run the command above to
+render scripts. After updating from an older analyzer, rebuild it once with
+`--rebuild` so that `script_data.json` is available.
+
+Generation has been checked against nine real sample combinations on Linux.
+Frida 17 has additionally been exercised on local x64 controlled-memory fixtures
+and native hooks. Cross-platform live Dart hooks and imports into an actual IDA 9
+installation still require validation; generated output alone is not runtime
+acceptance.

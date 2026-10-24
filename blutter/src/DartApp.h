@@ -98,6 +98,5 @@ private:
 	friend class CodeAnalyzer;
 	friend class DartAnalyzer;
 	friend class DartDumper;
-	friend class FridaWriter;
 };
 

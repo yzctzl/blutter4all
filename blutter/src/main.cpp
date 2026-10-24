@@ -2,7 +2,6 @@
 #include "DartApp.h"
 #include "DartDumper.h"
 #include "CodeAnalyzer.h"
-#include "FridaWriter.h"
 #include "args.hxx"
 #include <filesystem>
 
@@ -51,15 +50,8 @@ int main(int argc, char** argv)
 		std::cout << "Generating application functions in asm folder\n";
 #endif
 		dumper.DumpCode((outDir / "asm").string().c_str());
-		dumper.Dump4Ida(outDir / "ida_script");
-
-#if defined(DART_COMPRESSED_POINTERS) && defined(TARGET_ARCH_ARM64)
-		std::cout << "Generating Frida script\n";
-		FridaWriter fwriter{ app };
-		fwriter.Create((outDir / "blutter_frida.js").string().c_str());
-#else
-		std::cout << "Skipping Frida script: the current template requires ARM64 compressed pointers\n";
-#endif
+		std::cout << "Exporting script metadata\n";
+		dumper.DumpScriptData(outDir / "script_data.json");
 
 		app.ExitScope();
 	}

@@ -85,7 +85,7 @@ Install Python 3.9+, Git and Visual Studio with **Desktop development with C++**
 python -m venv .venv
 .venv\Scripts\activate
 pip install "lief>=1.0,<1.1" requests
-python scripts\init_env_win.py
+python scripts\build\init_env_win.py
 ```
 
 ## Usage
@@ -133,7 +133,7 @@ queries, install the optional Python package and attach through the provided hos
 
 ```sh
 pip install 'frida>=17'
-python generate_scripts.py output/b4a.json --attach PID_OR_NAME
+python scripts/generate_scripts.py output/b4a.json --attach PID_OR_NAME
 ```
 
 Add `--device DEVICE_ID` for a USB or remote device. Self-mapped desktop ELF images
@@ -147,8 +147,11 @@ Existing user names and comments are preserved where possible.
 After editing either template, regenerate scripts without rerunning analysis:
 
 ```sh
-python generate_scripts.py output/b4a.json
+python scripts/generate_scripts.py output/b4a.json
 ```
+
+Helper scripts are grouped under `scripts/`: `build/` for SDK builds and Windows
+setup, `templates/` for Frida/IDA templates, and `tools/` for standalone utilities.
 
 ## Issues
 

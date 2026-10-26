@@ -19,7 +19,10 @@ def _image_info(path, arch):
     # Reuse the same LIEF selection and snapshot validation as the CLI. Only the
     # FAT container table is consulted for the exact original slice byte count.
     import lief
-    from extract_dart_info import _read_binary, _snapshot_info
+    if __package__:
+        from .extract_dart_info import _read_binary, _snapshot_info
+    else:
+        from extract_dart_info import _read_binary, _snapshot_info
     image, owner, outer_offset = _read_binary(str(path), arch)
     snapshot_hash, flags, _, os_name = _snapshot_info(str(path), image, outer_offset)
     apple = isinstance(image, lief.MachO.Binary)

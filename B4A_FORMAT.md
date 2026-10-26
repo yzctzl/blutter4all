@@ -136,7 +136,7 @@ and code units, marks `not_run`, and leaves each declaration unanalyzed.
 
 ## Consumers and evolution
 
-`generate_scripts.py output/b4a.json` derives the Frida script, IDA script/header
+`python scripts/generate_scripts.py output/b4a.json` derives the Frida script, IDA script/header
 and `script_analysis.jsonl`. The latter is a script cache containing its generation
 ID and grouped function bodies/aliases. It contains no additional analysis facts;
 Thread/ObjectPool and operand records are no longer redundantly copied into it.

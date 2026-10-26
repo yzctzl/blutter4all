@@ -7,14 +7,17 @@ import threading
 import uuid
 
 
-TEMPLATES = Path(__file__).resolve().parent / 'scripts'
+TEMPLATES = Path(__file__).resolve().parent / 'templates'
 
 
 def generate_scripts(metadata, outdir=None):
     metadata = Path(metadata)
     data = json.loads(metadata.read_text(encoding='utf-8'))
     if data.get('format') == 'b4a':
-        from b4a_data import validate_data
+        if __package__:
+            from .b4a_data import validate_data
+        else:
+            from b4a_data import validate_data
         validate_data(data)
     elif data.get('schema') != 1:
         raise ValueError('Unsupported script metadata version; rebuild blutter')

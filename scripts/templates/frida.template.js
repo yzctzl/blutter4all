@@ -361,7 +361,7 @@ let analysisRequest = 0;
 function queryAnalysis(offset) {
     const reply = `blutter-analysis-${++analysisRequest}`;
     return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('Full analysis requires the generate_scripts.py --attach host')), 10000);
+        const timer = setTimeout(() => reject(new Error('Full analysis requires the scripts/generate_scripts.py --attach host')), 10000);
         recv(reply, response => {
             clearTimeout(timer);
             if (response.error !== undefined) {

@@ -13,8 +13,9 @@ ICU_LIB_URL = 'https://github.com/unicode-org/icu/releases/download/release-73-2
 CAPSTONE_LIB_URL = 'https://github.com/capstone-engine/capstone/releases/download/4.0.2/capstone-4.0.2-win64.zip'
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-BIN_DIR = os.path.join(SCRIPT_DIR, '..', 'bin')
-EXTERNAL_DIR = os.path.join(SCRIPT_DIR, '..', 'external')
+ROOT_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+BIN_DIR = os.path.join(ROOT_DIR, 'bin')
+EXTERNAL_DIR = os.path.join(ROOT_DIR, 'external')
 ICU_WINDOWS_FILE = os.path.join(EXTERNAL_DIR, 'icu-windows.zip')
 ICU_WINDOWS_DIR = os.path.join(EXTERNAL_DIR, 'icu-windows')
 CAPSTONE_DIR = os.path.join(EXTERNAL_DIR, 'capstone')

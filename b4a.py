@@ -10,7 +10,7 @@ import sys
 import zipfile
 import tempfile
 import stat
-from dartvm_fetch_build import DartLibInfo
+from scripts.build.dartvm_fetch_build import DartLibInfo
 
 CMAKE_CMD = "cmake"
 NINJA_CMD = "ninja"
@@ -197,7 +197,7 @@ def cmake_blutter(input: BlutterInput):
 
 def get_dart_lib_info(libapp_path: str, libflutter_path: str, target_arch=None) -> DartLibInfo:
     # getting dart version
-    from extract_dart_info import extract_dart_info
+    from scripts.extract_dart_info import extract_dart_info
     dart_version, snapshot_hash, flags, arch, os_name = extract_dart_info(libapp_path, libflutter_path, target_arch)
     print(f'Dart version: {dart_version}, Snapshot: {snapshot_hash}, Target: {os_name} {arch}')
     print('flags: ' + ' '.join(flags))
@@ -214,7 +214,7 @@ def build_and_run(input: BlutterInput):
         else:
             dartlib_file = os.path.join(PKG_LIB_DIR, 'lib'+input.dart_info.lib_name+'.a')
         if not os.path.isfile(dartlib_file):
-            from dartvm_fetch_build import fetch_and_build
+            from scripts.build.dartvm_fetch_build import fetch_and_build
             fetch_and_build(input.dart_info)
         
         input.rebuild_blutter = True
@@ -266,14 +266,14 @@ def build_and_run(input: BlutterInput):
             return build_and_run(input)
         if not os.path.isfile(raw_data):
             raise RuntimeError('Analyzer did not export b4a data; rerun with --rebuild')
-        from b4a_data import publish_data
+        from scripts.b4a_data import publish_data
         publish_data(input.libapp_path, raw_data, public_data)
-        from generate_scripts import generate_scripts
+        from scripts.generate_scripts import generate_scripts
         generate_scripts(public_data)
 
 def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
     version, os_name, arch = dart_version.split('_')
-    from extract_dart_info import extract_snapshot_target
+    from scripts.extract_dart_info import extract_snapshot_target
     snapshot_hash, flags, snapshot_arch, snapshot_os = extract_snapshot_target(libapp_path, arch)
     if snapshot_arch != arch or snapshot_os != os_name:
         raise ValueError('Specified target does not match snapshot architecture/platform')

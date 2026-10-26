@@ -77,7 +77,7 @@ pip install 'lief>=1.0,<1.1' requests
 python -m venv .venv
 .venv\Scripts\activate
 pip install "lief>=1.0,<1.1" requests
-python scripts\init_env_win.py
+python scripts\build\init_env_win.py
 ```
 
 ## 使用
@@ -124,7 +124,7 @@ python b4a.py path/to/app.apk output --rebuild
 
 ```sh
 pip install 'frida>=17'
-python generate_scripts.py output/b4a.json --attach PID_OR_NAME
+python scripts/generate_scripts.py output/b4a.json --attach PID_OR_NAME
 ```
 
 USB 或远程设备添加 `--device DEVICE_ID`。对于自行映射 ELF 的桌面应用，
@@ -138,8 +138,11 @@ USB 或远程设备添加 `--device DEVICE_ID`。对于自行映射 ELF 的桌�
 修改模板后，无需重新分析即可生成脚本：
 
 ```sh
-python generate_scripts.py output/b4a.json
+python scripts/generate_scripts.py output/b4a.json
 ```
+
+辅助脚本统一放在 `scripts/`：`build/` 用于 SDK 构建和 Windows 环境准备，
+`templates/` 存放 Frida/IDA 模板，`tools/` 存放独立辅助工具。
 
 ## 问题反馈
 

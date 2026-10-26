@@ -1,6 +1,7 @@
 .vscode/
 bin/
 build/
+!scripts/build/
 tmp/
 temp/
 out/

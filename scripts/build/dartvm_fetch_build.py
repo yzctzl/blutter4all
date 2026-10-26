@@ -12,12 +12,13 @@ CMAKE_CMD = "cmake"
 NINJA_CMD = "ninja"
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-CMAKE_TEMPLATE_FILE = os.path.join(SCRIPT_DIR, 'scripts', 'CMakeLists.txt')
-CREATE_SRCLIST_FILE = os.path.join(SCRIPT_DIR, 'scripts', 'dartvm_create_srclist.py')
-MAKE_VERSION_FILE = os.path.join(SCRIPT_DIR, 'scripts', 'dartvm_make_version.py')
+ROOT_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+CMAKE_TEMPLATE_FILE = os.path.join(SCRIPT_DIR, 'CMakeLists.txt')
+CREATE_SRCLIST_FILE = os.path.join(SCRIPT_DIR, 'dartvm_create_srclist.py')
+MAKE_VERSION_FILE = os.path.join(SCRIPT_DIR, 'dartvm_make_version.py')
 
-SDK_DIR = os.path.join(SCRIPT_DIR, 'dartsdk')
-BUILD_DIR = os.path.join(SCRIPT_DIR, 'build')
+SDK_DIR = os.path.join(ROOT_DIR, 'dartsdk')
+BUILD_DIR = os.path.join(ROOT_DIR, 'build')
 
 #DART_GIT_URL = 'https://dart.googlesource.com/sdk.git'
 DART_GIT_URL = 'https://github.com/dart-lang/sdk.git'

@@ -247,15 +247,29 @@ def build_and_run(input: BlutterInput):
             cmake_blutter(input)
             assert os.path.isfile(input.blutter_file), "Build complete but cannot find Blutter binary: " + input.blutter_file
 
-        # Remove stale metadata before invoking a possibly cached analyzer.
-        script_data = os.path.join(input.outdir, 'script_data.json')
-        if os.path.isfile(script_data):
-            os.remove(script_data)
+        # The C++ export is private until original-file identity is attached and
+        # the shared document is validated. Never publish stale analysis.
+        raw_data = os.path.join(input.outdir, '.b4a.raw.json')
+        public_data = os.path.join(input.outdir, 'b4a.json')
+        legacy_data = os.path.join(input.outdir, 'script_data.json')
+        for filename in (raw_data, public_data, legacy_data):
+            if os.path.isfile(filename):
+                os.remove(filename)
         subprocess.run([input.blutter_file, '-i', input.libapp_path, '-o', input.outdir], check=True)
+        if not os.path.isfile(raw_data) and os.path.isfile(legacy_data):
+            if input.rebuild_blutter:
+                raise RuntimeError('Rebuilt analyzer still uses the old export format')
+            print('Updating cached analyzer for the unified b4a export')
+            input.rebuild_blutter = True
+            # Re-enter the normal build path so deleted SDK packages are fetched
+            # just as they are for an explicit --rebuild. Retry at most once.
+            return build_and_run(input)
+        if not os.path.isfile(raw_data):
+            raise RuntimeError('Analyzer did not export b4a data; rerun with --rebuild')
+        from b4a_data import publish_data
+        publish_data(input.libapp_path, raw_data, public_data)
         from generate_scripts import generate_scripts
-        if not os.path.isfile(script_data):
-            raise RuntimeError('Analyzer did not export script metadata; rerun with --rebuild')
-        generate_scripts(script_data)
+        generate_scripts(public_data)
 
 def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
     version, os_name, arch = dart_version.split('_')

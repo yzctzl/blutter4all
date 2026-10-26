@@ -27,6 +27,8 @@ int main(int argc, char** argv)
 
 		// A failed load or analysis must not leave metadata from an earlier run.
 		std::filesystem::remove(outDir / "script_data.json");
+		std::filesystem::remove(outDir / "b4a.json");
+		std::filesystem::remove(outDir / ".b4a.raw.json");
 		DartApp app{ libappPath.c_str() };
 		std::cout << std::format("libapp is loaded at {:#x}\n", static_cast<uintptr_t>(app.base()));
 		std::cout << std::format("Dart heap at {:#x}\n", app.heap_base());
@@ -53,7 +55,7 @@ int main(int argc, char** argv)
 #endif
 		dumper.DumpCode((outDir / "asm").string().c_str());
 		std::cout << "Exporting script metadata\n";
-		dumper.DumpScriptData(outDir / "script_data.json");
+		dumper.DumpScriptData(outDir / ".b4a.raw.json");
 
 		app.ExitScope();
 	}

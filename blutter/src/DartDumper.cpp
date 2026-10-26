@@ -12,6 +12,7 @@
 #include "DartThreadInfo.h"
 #include "CodeAnalyzer.h"
 #include "vm/stack_frame.h"
+#include "vm/heap/safepoint.h"
 
 // TODO: move arm64 specific code to *_arm64 file
 
@@ -133,7 +134,40 @@ void DartDumper::DumpScriptData(const std::filesystem::path& filename)
 #else
 		of << ",\"compressed\":false";
 #endif
-		of << "},\"image\":{\"isolateData\":"
+		of << "},\"registers\":{";
+		auto registerName = [](dart::Register reg) {
+#if defined(TARGET_ARCH_X64)
+			return std::string(CpuRegister{reg}.Name());
+#elif defined(TARGET_ARCH_ARM64)
+			return std::format("x{}", static_cast<int>(reg));
+#else
+			return std::format("r{}", static_cast<int>(reg));
+#endif
+		};
+		of << "\"dartSp\":" << Util::JsonQuote(registerName(dart::SPREG))
+			<< ",\"fp\":" << Util::JsonQuote(registerName(dart::FPREG))
+			<< ",\"thread\":" << Util::JsonQuote(registerName(dart::THR))
+			<< ",\"pool\":" << Util::JsonQuote(registerName(dart::PP))
+			<< ",\"argumentsDescriptor\":" << Util::JsonQuote(registerName(dart::ARGS_DESC_REG));
+#if defined(TARGET_ARCH_ARM64)
+		of << ",\"nativeSp\":\"sp\",\"lr\":\"x30\"";
+#elif defined(TARGET_ARCH_ARM)
+		of << ",\"nativeSp\":\"r13\",\"lr\":\"r14\"";
+#else
+		of << ",\"nativeSp\":\"rsp\",\"lr\":null";
+#endif
+		of << "},\"codeUnits\":[";
+		dumpCodeUnits(of);
+#ifdef NO_CODE_ANALYSIS
+		of << "],\"analysisState\":\"not_run\",";
+#else
+		of << "],\"analysisState\":\"available\",";
+#endif
+		of << "\"image\":{\"vmData\":"
+			<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.vm_snapshot_data - static_cast<const uint8_t*>(app.lib_base))))
+			<< ",\"vmInstructions\":"
+			<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.vm_snapshot_instructions - static_cast<const uint8_t*>(app.lib_base))))
+			<< ",\"isolateData\":"
 			<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.isolate_snapshot_data - static_cast<const uint8_t*>(app.lib_base))))
 			<< ",\"isolateInstructions\":"
 			<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.isolate_snapshot_instructions - static_cast<const uint8_t*>(app.lib_base))))
@@ -194,6 +228,56 @@ void DartDumper::DumpScriptData(const std::filesystem::path& filename)
 		std::error_code ec;
 		std::filesystem::remove(temporary, ec);
 		throw;
+	}
+}
+
+// Read original Code metadata, independently of analyzer-created stub splits and
+// display names. Several Code objects may share one payload; the publisher merges
+// those records without losing their entry points.
+void DartDumper::dumpCodeUnits(std::ostream& of)
+{
+	class CodeVisitor final : public dart::ObjectVisitor {
+	public:
+		std::vector<dart::CodePtr> codes;
+		void VisitObject(dart::ObjectPtr object) override {
+			if (object->IsCode())
+				codes.push_back(dart::Code::RawCast(object));
+		}
+	} visitor;
+	{
+		dart::HeapIterationScope scope(dart::Thread::Current());
+		scope.IterateOldObjects(&visitor);
+	}
+	auto& code = dart::Code::Handle();
+	bool first = true;
+	for (const auto ptr : visitor.codes) {
+		code = ptr;
+		const auto payload = code.PayloadStart();
+		const auto size = static_cast<intptr_t>(code.Size());
+		// VM-generated host stubs and discarded bodies are not input-file code.
+		if (size <= 0 || payload < static_cast<uintptr_t>(app.base()) ||
+			payload - app.base() >= (uint64_t{1} << 30))
+			continue;
+		const auto start = payload - app.base();
+		if (!first) of << ',';
+		first = false;
+		of << "{\"start\":" << Util::JsonQuote(std::format("{:#x}", start))
+			<< ",\"end\":" << Util::JsonQuote(std::format("{:#x}", start + size))
+			<< ",\"source\":\"snapshot\",\"kind\":" << Util::JsonQuote(code.IsStubCode() ? "stub" : "dart")
+			<< ",\"primaryEntry\":" << Util::JsonQuote(std::format("{:#x}", code.EntryPoint() - app.base()))
+			<< ",\"entries\":[";
+		bool firstEntry = true;
+		auto entry = [&](uintptr_t address, const char* kind) {
+			if (!firstEntry) of << ',';
+			firstEntry = false;
+			of << "{\"rva\":" << Util::JsonQuote(std::format("{:#x}", address - app.base()))
+				<< ",\"kind\":" << Util::JsonQuote(kind) << '}';
+		};
+		entry(code.EntryPoint(), "normal");
+		entry(code.MonomorphicEntryPoint(), "monomorphic");
+		entry(code.UncheckedEntryPoint(), "unchecked");
+		entry(code.MonomorphicUncheckedEntryPoint(), "monomorphic_unchecked");
+		of << "]}";
 	}
 }
 

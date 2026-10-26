@@ -26,6 +26,7 @@ private:
 	void dumpScriptStructures(std::ostream& of);
 	void dumpScriptOperands(std::ostream& of);
 	void dumpScriptAnalysis(std::ostream& of);
+	void dumpCodeUnits(std::ostream& of);
 	void dumpScriptClassFields(std::ostream& of, DartClass& cls);
 
 	const std::string& getQuoteString(dart::Object& obj);

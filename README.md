@@ -125,15 +125,15 @@ python b4a.py path/to/app.apk output --rebuild
 | `objs.txt`, `pp.txt` | Object and object-pool dumps |
 | `blutter_frida.js` | Frida script |
 | `ida_script/` | IDA import script and structure header |
-| `script_data.json` | Shared metadata for script generation |
-| `script_analysis.jsonl` | Full analysis companion for both scripts |
+| `b4a.json` | Unified, versioned data for Ghidra and script generation ([format](B4A_FORMAT.md)) |
+| `script_analysis.jsonl` | Derived function-analysis companion for Frida/IDA |
 
 For **Frida**, edit `Config.hooks` in the generated script. For full analysis
 queries, install the optional Python package and attach through the provided host:
 
 ```sh
 pip install 'frida>=17'
-python generate_scripts.py output/script_data.json --attach PID_OR_NAME
+python generate_scripts.py output/b4a.json --attach PID_OR_NAME
 ```
 
 Add `--device DEVICE_ID` for a USB or remote device. Self-mapped desktop ELF images
@@ -147,7 +147,7 @@ Existing user names and comments are preserved where possible.
 After editing either template, regenerate scripts without rerunning analysis:
 
 ```sh
-python generate_scripts.py output/script_data.json
+python generate_scripts.py output/b4a.json
 ```
 
 ## Issues

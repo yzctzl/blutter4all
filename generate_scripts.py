@@ -1,4 +1,4 @@
-"""Render Frida 17+ and IDAPython 9+ scripts from SDK-derived metadata."""
+"""Render Frida 17+ and IDAPython 9+ scripts from b4a.json."""
 import argparse
 import json
 from pathlib import Path
@@ -13,7 +13,10 @@ TEMPLATES = Path(__file__).resolve().parent / 'scripts'
 def generate_scripts(metadata, outdir=None):
     metadata = Path(metadata)
     data = json.loads(metadata.read_text(encoding='utf-8'))
-    if data.get('schema') != 1:
+    if data.get('format') == 'b4a':
+        from b4a_data import validate_data
+        validate_data(data)
+    elif data.get('schema') != 1:
         raise ValueError('Unsupported script metadata version; rebuild blutter')
     target = data['target']
     arch = target['arch']
@@ -38,8 +41,6 @@ def generate_scripts(metadata, outdir=None):
     analysis_id = uuid.uuid4().hex
     with (outdir / 'script_analysis.jsonl').open('w', encoding='utf-8') as stream:
         stream.write(json.dumps(['@id', analysis_id]) + '\n')
-        for key in ('structures', 'operands'):
-            stream.write(json.dumps(['@' + key, data[key]], ensure_ascii=True, separators=(',', ':')) + '\n')
         bodies = data.pop('analysis')
         # Several declarations may share machine code (canonical tear-offs,
         # getters, etc.). Preserve every declaration instead of JSON last-wins.
@@ -139,7 +140,7 @@ def attach_frida(outdir, process, device_id=None, script_path=None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('metadata', help='script_data.json produced by the C++ analyzer')
+    parser.add_argument('metadata', help='b4a.json (legacy script_data.json is also accepted)')
     parser.add_argument('-o', '--outdir', help='defaults to the metadata directory')
     parser.add_argument('--attach', metavar='PID_OR_NAME', help='attach using Frida 17+ and serve full analysis')
     parser.add_argument('--device', help='Frida device ID (default: local)')

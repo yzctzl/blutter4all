@@ -116,15 +116,15 @@ python b4a.py path/to/app.apk output --rebuild
 | `objs.txt`、`pp.txt` | 对象和对象池信息 |
 | `blutter_frida.js` | Frida 脚本 |
 | `ida_script/` | IDA 导入脚本和结构体头文件 |
-| `script_data.json` | 用于生成脚本的共享元数据 |
-| `script_analysis.jsonl` | 两类脚本使用的完整分析数据文件 |
+| `b4a.json` | Ghidra 和脚本共用的统一数据文件，包含版本标识（[格式说明](B4A_FORMAT.md)） |
+| `script_analysis.jsonl` | 从统一数据提取的 Frida/IDA 函数分析配套文件 |
 
 使用 **Frida** 时，编辑生成脚本中的 `Config.hooks`。如需查询完整分析结果，
 安装可选 Python 依赖并通过配套程序附加到进程：
 
 ```sh
 pip install 'frida>=17'
-python generate_scripts.py output/script_data.json --attach PID_OR_NAME
+python generate_scripts.py output/b4a.json --attach PID_OR_NAME
 ```
 
 USB 或远程设备添加 `--device DEVICE_ID`。对于自行映射 ELF 的桌面应用，
@@ -138,7 +138,7 @@ USB 或远程设备添加 `--device DEVICE_ID`。对于自行映射 ELF 的桌�
 修改模板后，无需重新分析即可生成脚本：
 
 ```sh
-python generate_scripts.py output/script_data.json
+python generate_scripts.py output/b4a.json
 ```
 
 ## 问题反馈

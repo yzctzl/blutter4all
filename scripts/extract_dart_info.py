@@ -144,7 +144,7 @@ def _snapshot_info(path, image, slice_offset):
     if apple:
         segments = [(s.virtual_address, s.virtual_size, s.file_offset, s.file_size)
                     for s in image.segments if s.name != '__PAGEZERO' and s.virtual_size]
-        symbols = [s for s in image.symbols if s.name == '_kDartVmSnapshotData' and
+        symbols = [s for s in image.symbols if s.name in ('_kDartVmSnapshotData', '_kDartSnapshotData') and
                    s.type == lief.MachO.Symbol.TYPE.SECTION and
                    0 < s.numberof_sections <= len(image.sections)]
         base, file_size = slice_offset + image.fat_offset, image.original_size
@@ -154,7 +154,7 @@ def _snapshot_info(path, image, slice_offset):
         segments = [(s.virtual_address, s.virtual_size, s.file_offset, s.physical_size)
                     for s in image.segments if s.type == lief.ELF.Segment.TYPE.LOAD and s.virtual_size]
         symbols = [s for s in image.dynamic_symbols
-                   if s.name == '_kDartVmSnapshotData' and s.shndx != 0]
+                   if s.name in ('_kDartVmSnapshotData', '_kDartSnapshotData') and s.shndx != 0]
         base, file_size = 0, os.path.getsize(path)
     segments.sort()
     if not segments or segments[0][0] != 0:
@@ -167,7 +167,7 @@ def _snapshot_info(path, image, slice_offset):
             raise ValueError('Invalid file-backed snapshot segment range')
         end = address + size
     if len(symbols) != 1 or symbols[0].value % 16:
-        raise ValueError('Missing, duplicate or unaligned VM snapshot data symbol')
+        raise ValueError('Missing, duplicate or unaligned snapshot data symbol')
     address = symbols[0].value
     segment = next((s for s in segments if s[0] <= address and address - s[0] + 53 <= s[3]), None)
     if segment is None:

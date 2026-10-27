@@ -63,7 +63,11 @@ Mappings are non-overlapping and sorted by RVA. ELF uses nonempty PT_LOAD segmen
 Mach-O excludes __PAGEZERO. BSS has no file bytes.
 
 `image.vmData`, `vmInstructions`, `isolateData`, `isolateInstructions` are snapshot
-symbol RVAs, not the first function addresses. `checks` contains auxiliary
+symbol RVAs, not the first function addresses. For merged Data/Text snapshots,
+the VM fields are `null`; the isolate fields point to the combined data and text.
+Closure layouts expose either `contextOffset`, or `elementsOffset`, `lengthOffset`
+and `lengthShift` (context is the last element of the decoded length).
+`checks` contains auxiliary
 `[rva, sixteenBytesAsHex]` observations retained for existing script verification.
 These few bytes do not replace original-file identity checks for importing data.
 

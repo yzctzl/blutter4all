@@ -1832,7 +1832,7 @@ bool ArmParameterRecovery::transfer(size_t& index)
 			if (parameter >= 0 && parameter < fn.data.params.NumParam())
 				result = {Value, 0, parameter};
 		} else if (address.kind == Value && address.parameter == 0 && fn.data.dartFn.IsClosure() &&
-				   memory->offset == AOT_Closure_context_offset - dart::kHeapObjectTag) {
+				   memory->offset == fn.data.dartFn.ClosureContextOffset() - dart::kHeapObjectTag) {
 			result = {Context};
 		} else if (memory->base == CSREG_DART_FP) {
 			for (int i = 0; i < fn.data.params.NumParam(); ++i)

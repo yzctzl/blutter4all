@@ -194,11 +194,12 @@ LibAppInfo MachOHelper::MapLibApp(const char* path)
 		imageSize = segment.address + segment.size;
 	}
 
-	constexpr std::array<std::string_view, 4> names{
+	constexpr std::array<std::string_view, 6> names{
 		"_kDartVmSnapshotData", "_kDartVmSnapshotInstructions",
-		"_kDartIsolateSnapshotData", "_kDartIsolateSnapshotInstructions"};
-	std::array<uint64_t, 4> addresses{};
-	std::array<bool, 4> found{};
+		"_kDartIsolateSnapshotData", "_kDartIsolateSnapshotInstructions",
+		"_kDartSnapshotData", "_kDartSnapshotText"};
+	std::array<uint64_t, 6> addresses{};
+	std::array<bool, 6> found{};
 	for (uint32_t i = 0; i < symbolsCount; ++i) {
 		const uint64_t at = symbolsOffset + uint64_t(i) * 16;
 		const auto type = file.Range(at + 4, 1)[0];
@@ -247,7 +248,10 @@ LibAppInfo MachOHelper::MapLibApp(const char* path)
 		Require(address % 16 == 0, "Unaligned snapshot symbol");
 		addresses[index] = address; found[index] = true;
 	}
-	Require(std::all_of(found.begin(), found.end(), [](bool value) { return value; }), "Missing Dart snapshot symbols");
+	const bool single = found[4] && found[5];
+	const bool split = found[0] && found[1] && found[2] && found[3];
+	Require((single && !found[0] && !found[1] && !found[2] && !found[3]) ||
+		(split && !found[4] && !found[5]), "Incomplete or mixed Dart snapshot symbols");
 
 	// Anonymous writable storage: no target imports or constructors are run.
 	// Zero fill includes BSS, whose relative position is used by Image::bss().
@@ -258,5 +262,6 @@ LibAppInfo MachOHelper::MapLibApp(const char* path)
 	for (const auto& segment : segments)
 		if (segment.fileSize != 0)
 			std::memcpy(image + segment.address, file.Range(segment.offset, segment.fileSize).data(), static_cast<size_t>(segment.fileSize));
-	return LibAppInfo{image, image + addresses[0], image + addresses[1], image + addresses[2], image + addresses[3], std::move(owner)};
+	return LibAppInfo{image, single ? nullptr : image + addresses[0], single ? nullptr : image + addresses[1],
+		image + addresses[single ? 4 : 2], image + addresses[single ? 5 : 3], std::move(owner)};
 }

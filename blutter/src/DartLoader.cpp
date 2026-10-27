@@ -25,8 +25,10 @@ static void init_dart(const uint8_t* vm_snapshot_data, const uint8_t* vm_snapsho
 	Dart_InitializeParams init_params;
 	memset(&init_params, 0, sizeof(init_params));
 	init_params.version = DART_INITIALIZE_PARAMS_CURRENT_VERSION;
+#ifndef DART_SINGLE_SNAPSHOT
 	init_params.vm_snapshot_data = vm_snapshot_data;
 	init_params.vm_snapshot_instructions = vm_snapshot_instructions;
+#endif
 	init_params.start_kernel_isolate = false;
 	// other params are no needed if snapshot is not run
 	error = Dart_Initialize(&init_params);
@@ -70,6 +72,13 @@ Dart_Isolate DartLoader::Load(LibAppInfo& libInfo)
 {
 	init_vm_flags();
 
+#ifdef DART_SINGLE_SNAPSHOT
+	if (libInfo.vm_snapshot_data != nullptr)
+		throw std::invalid_argument("This Dart SDK requires a single snapshot");
+#else
+	if (libInfo.vm_snapshot_data == nullptr)
+		throw std::invalid_argument("This Dart SDK requires separate VM and isolate snapshots");
+#endif
 	init_dart(libInfo.vm_snapshot_data, libInfo.vm_snapshot_instructions);
 
 	try {

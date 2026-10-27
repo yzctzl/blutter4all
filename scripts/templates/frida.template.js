@@ -233,9 +233,17 @@ class DartReader {
         case C.CidClosure: {
             const entry = address.add(cls.epOffset).readPointer();
             const offset = imageBase === null ? null : entry.sub(imageBase).toString();
+            let contextOffset = cls.contextOffset;
+            if (contextOffset === undefined) {
+                const flags = this.smi(this.taggedSlot(address.add(cls.lengthOffset)));
+                const length = Math.floor(flags / 2 ** cls.lengthShift);
+                if (!Number.isSafeInteger(length) || length < 1 || length > 4)
+                    throw new Error('Invalid closure element count');
+                contextOffset = cls.elementsOffset + (length - 1) * Target.slotSize;
+            }
             return { $type: 'Closure', entry: entry.toString(), offset,
                 function: Blutter.functions.find(row => row[0] === offset)?.[2] ?? null,
-                context: this.readTagged(this.taggedSlot(address.add(cls.contextOffset)), depth - 1) };
+                context: this.readTagged(this.taggedSlot(address.add(contextOffset)), depth - 1) };
         }
         case C.CidContext: {
             // UntaggedContext::num_variables_ is int32_t, not a tagged Smi.

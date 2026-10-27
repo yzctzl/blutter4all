@@ -163,10 +163,13 @@ void DartDumper::DumpScriptData(const std::filesystem::path& filename)
 #else
 		of << "],\"analysisState\":\"available\",";
 #endif
+		const auto snapshotRva = [&](const uint8_t* address) {
+			return address ? Util::JsonQuote(std::format("{:#x}", address - static_cast<const uint8_t*>(app.lib_base))) : "null";
+		};
 		of << "\"image\":{\"vmData\":"
-			<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.vm_snapshot_data - static_cast<const uint8_t*>(app.lib_base))))
+			<< snapshotRva(app.vm_snapshot_data)
 			<< ",\"vmInstructions\":"
-			<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.vm_snapshot_instructions - static_cast<const uint8_t*>(app.lib_base))))
+			<< snapshotRva(app.vm_snapshot_instructions)
 			<< ",\"isolateData\":"
 			<< Util::JsonQuote(std::format("{:#x}", static_cast<uint64_t>(app.isolate_snapshot_data - static_cast<const uint8_t*>(app.lib_base))))
 			<< ",\"isolateInstructions\":"
@@ -640,7 +643,14 @@ void DartDumper::dumpScriptLayouts(std::ostream& of)
 				of << "{\"id\":" << dartCls->Id() << ",";
 				of << "\"name\":\"Closure\",";
 				of << "\"fnOffset\":" << AOT_Closure_function_offset << ",";
+#ifdef DART_SINGLE_SNAPSHOT
+				// Context is the last element; its index varies with type arguments.
+				of << "\"elementsOffset\":" << AOT_Closure_elements_start_offset << ",";
+				of << "\"lengthOffset\":" << AOT_Closure_length_and_flags_offset << ",";
+				of << "\"lengthShift\":" << dart::UntaggedClosure::kLengthBitsPos << ",";
+#else
 				of << "\"contextOffset\":" << AOT_Closure_context_offset << ",";
+#endif
 				of << "\"epOffset\":" << AOT_Closure_entry_point_offset << "}";
 				break;
 			case dart::kContextCid:

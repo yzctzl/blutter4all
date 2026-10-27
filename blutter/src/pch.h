@@ -23,6 +23,10 @@
 
 PRAGMA_WARNING(push, 0)
 #include <include/dart_api.h>
+#ifdef kSnapshotDataAsmSymbol
+// Dart removed the VM isolate and merged its snapshot into the application.
+#define DART_SINGLE_SNAPSHOT 1
+#endif
 #include <vm/dart_entry.h>
 #include <vm/dart.h>
 #include <vm/object.h>

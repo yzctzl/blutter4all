@@ -80,6 +80,7 @@ if (MSVC)
 		set(cc_opts /Oy /GR- /sdl- /Oi /GL /Gy /Zc:wchar_t /Zc:inline)
 		target_link_options(${PROJECT_NAME} PRIVATE /LTCG /OPT:REF /OPT:ICF)
 	endif()
+	list(APPEND cc_opts /Zc:preprocessor /utf-8)
 else()
 	# TODO: gcc options to remove dead code in static dartvm library
 	set(cc_opts

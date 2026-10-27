@@ -73,6 +73,8 @@ public:
 
 	bool IsNative() const   { return is_native; }
 	bool IsClosure() const  { return is_closure; }
+	intptr_t ClosureContextOffset() const;
+	intptr_t ClosureDelayedTypeArgumentsOffset() const;
 	bool IsFfi() const      { return is_ffi; }
 	bool IsStatic() const   { return is_static; }
 	// Dart's implicit closure/FFI parameter is a closure object, not 'this'.

@@ -331,6 +331,7 @@ void DartApp::loadStubs(dart::ObjectStore* store)
 
 	// Note: some stub might contain multiple of duplicated stubs
 	// these stubs are called "_iso_stub_" in runtime/vm/stub_code.cc
+#ifndef DART_SINGLE_SNAPSHOT
 #define DO(member, name) \
 	ptr = store->member(); \
 	code = ptr; \
@@ -351,6 +352,9 @@ void DartApp::loadStubs(dart::ObjectStore* store)
 	// load VM stub code
 	// the dart entry point "static void main()" is a LazyCompileVMStub which call "main" stub (a real main)
 	ASSERT(dart::StubCode::HasBeenInitialized());
+#else
+	throwStubAddr = dart::StubCode::Throw().EntryPoint();
+#endif
 #define DO(name) {\
 		const auto& code = dart::StubCode::name(); \
 		ep_addr = code.EntryPoint() - base(); \
@@ -630,7 +634,10 @@ void DartApp::finalizeFunctionsInfo()
 			continue;
 		const auto& sig = dart::FunctionType::Handle(sigPtr);
 		if (!sig.IsNull()) {
-			dartFn->Signature().returnType = TypeDb()->FindOrAdd(sig.result_type());
+			// Optimized-out placeholder functions can retain an empty signature
+			// with a null result type. Keep it unknown rather than invent dynamic.
+			if (sig.result_type() != dart::AbstractType::null())
+				dartFn->Signature().returnType = TypeDb()->FindOrAdd(sig.result_type());
 
 			// function type paramaters
 			const auto& type_params = dart::TypeParameters::Handle(sig.type_parameters());

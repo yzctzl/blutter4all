@@ -573,6 +573,11 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 
 		INSN_ASSERT(GetThreadLeafFunction(thr_offset));
 
+		// NativeCallInstr may pass a leaf entry in R9 to a safepoint stub
+		// called through another register. It has no inline leaf-call frame.
+		if (insn.id() == ARM64_INS_BLR && A64::Register{ insn.ops(0).reg } != tmp_target_reg)
+			return nullptr;
+
 		std::vector<std::unique_ptr<MoveRegInstr>> movILs;
 		while (true) {
 			auto il = processMoveRegInstr(insn);
@@ -1955,7 +1960,7 @@ std::unique_ptr<SetupParametersInstr> FunctionAnalyzer::processPrologueParameter
 
 	// PrologueBuilder::BuildClosureContextHandling()
 	// closure context handling
-	if (dartFn->IsClosure() && insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == AOT_Closure_context_offset - dart::kHeapObjectTag) {
+	if (dartFn->IsClosure() && insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == dartFn->ClosureContextOffset() - dart::kHeapObjectTag) {
 		const auto arg1Reg = [&] {
 			if (fnInfo->params.numFixedParam > 0) {
 				return fnInfo->params[0].valReg;
@@ -2004,7 +2009,7 @@ std::unique_ptr<SetupParametersInstr> FunctionAnalyzer::processPrologueParameter
 				a1reg = insn.ops(0).reg;
 				++insn;
 			}
-			if (insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == AOT_Closure_delayed_type_arguments_offset - dart::kHeapObjectTag) {
+			if (insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == dartFn->ClosureDelayedTypeArgumentsOffset() - dart::kHeapObjectTag) {
 				if (a1reg != ARM64_REG_INVALID) {
 					// TODO: calculate a number of function parameter
 					return A64::Register{ a1reg };

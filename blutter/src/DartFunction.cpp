@@ -11,6 +11,36 @@
 // place static member because no DartFnBase source file
 intptr_t DartFnBase::lib_base;
 
+intptr_t DartFunction::ClosureContextOffset() const
+{
+#ifdef DART_SINGLE_SNAPSHOT
+	if (!IsClosure() || ptr == dart::Function::null())
+		return -1;
+	// Match Slot::GetClosureContextSlot: optional type-argument fields precede
+	// context in elements[]. Use target offsets, not host sizeof(Closure).
+	const auto& function = dart::Function::Handle(ptr);
+	const auto index = dart::UntaggedClosure::ContextIndex(
+		dart::Closure::HasDelayedTypeArgumentsField(function),
+		dart::Closure::HasInstantiatorTypeArgumentsField(function),
+		dart::Closure::HasFunctionTypeArgumentsField(function));
+	return AOT_Closure_elements_start_offset + index * dart::kCompressedWordSize;
+#else
+	return AOT_Closure_context_offset;
+#endif
+}
+
+intptr_t DartFunction::ClosureDelayedTypeArgumentsOffset() const
+{
+#ifdef DART_SINGLE_SNAPSHOT
+	if (!IsClosure() || ptr == dart::Function::null() ||
+		!dart::Closure::HasDelayedTypeArgumentsField(dart::Function::Handle(ptr)))
+		return -1;
+	return AOT_Closure_elements_start_offset + dart::UntaggedClosure::kDelayedTypeArgumentsIndex * dart::kCompressedWordSize;
+#else
+	return AOT_Closure_delayed_type_arguments_offset;
+#endif
+}
+
 DartFunction::DartFunction(DartClass& cls, const dart::FunctionPtr ptr) : DartFnBase(), cls(cls), parent(nullptr), ptr(ptr), kind(NORMAL)
 {
 	auto* zone = dart::Thread::Current()->zone();
@@ -247,8 +277,12 @@ void DartFunction::PrintHead(std::ostream& of) const
 	else {
 		dart::ZoneTextBuffer buffer(zone);
 		const auto& result_type = dart::AbstractType::Handle(sig.result_type());
-		result_type.PrintName(dart::Object::kScrubbedName, &buffer);
-		of << buffer.buffer() << " " << name;
+		if (result_type.IsNull())
+			of << "_ " << name;
+		else {
+			result_type.PrintName(dart::Object::kScrubbedName, &buffer);
+			of << buffer.buffer() << " " << name;
+		}
 		// function type paramaters
 		const auto& type_params = dart::TypeParameters::Handle(zone, sig.type_parameters());
 		if (!type_params.IsNull()) {

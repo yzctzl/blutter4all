@@ -85,11 +85,12 @@ LibAppInfo ElfHelper::MapLibAppSo(const char* path)
         Require(s.address >= imageSize, "Overlapping virtual segments");
         imageSize = s.address + s.size;
     }
-    constexpr std::array<std::string_view, 4> names{
+    constexpr std::array<std::string_view, 6> names{
         "_kDartVmSnapshotData", "_kDartVmSnapshotInstructions",
-        "_kDartIsolateSnapshotData", "_kDartIsolateSnapshotInstructions"};
-    std::array<uint64_t, 4> addresses{};
-    std::array<bool, 4> found{};
+        "_kDartIsolateSnapshotData", "_kDartIsolateSnapshotInstructions",
+        "_kDartSnapshotData", "_kDartSnapshotText"};
+    std::array<uint64_t, 6> addresses{};
+    std::array<bool, 6> found{};
     for (uint32_t i = 0; i < shnum; ++i) {
         const auto at = shoff + uint64_t(i) * shSize;
         if (file.U32(at + 4) != 11) continue; // SHT_DYNSYM
@@ -134,12 +135,16 @@ LibAppInfo ElfHelper::MapLibAppSo(const char* path)
             addresses[n] = address; found[n] = true;
         }
     }
-    Require(std::all_of(found.begin(), found.end(), [](bool v) { return v; }), "Missing Dart snapshot symbols");
+    const bool single = found[4] && found[5];
+    const bool split = found[0] && found[1] && found[2] && found[3];
+    Require((single && !found[0] && !found[1] && !found[2] && !found[3]) ||
+            (split && !found[4] && !found[5]), "Incomplete or mixed Dart snapshot symbols");
     std::shared_ptr<void> owner(::operator new(static_cast<size_t>(imageSize), std::align_val_t{kAlignment}),
         [](void* p) { ::operator delete(p, std::align_val_t{kAlignment}); });
     auto* image = static_cast<uint8_t*>(owner.get());
     std::memset(image, 0, static_cast<size_t>(imageSize));
     for (const auto& s : segments)
         if (s.fileSize) std::memcpy(image + s.address, file.Range(s.offset, s.fileSize).data(), static_cast<size_t>(s.fileSize));
-    return LibAppInfo{image, image + addresses[0], image + addresses[1], image + addresses[2], image + addresses[3], std::move(owner)};
+    return LibAppInfo{image, single ? nullptr : image + addresses[0], single ? nullptr : image + addresses[1],
+        image + addresses[single ? 4 : 2], image + addresses[single ? 5 : 3], std::move(owner)};
 }

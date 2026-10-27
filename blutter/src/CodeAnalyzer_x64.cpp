@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vm/stack_frame.h>
+#include <vm/stub_code.h>
 
 #ifndef NO_CODE_ANALYSIS
 // SDK paths below are relative to dartsdk/<version>/runtime/. The recognizers
@@ -1306,12 +1307,17 @@ std::optional<BarrierKind> FunctionAnalyzer::writeBarrierCallKind(const cs_x86_o
 	}
 	if (target.type != X86_OP_IMM)
 		return std::nullopt;
+#ifdef DART_SINGLE_SNAPSHOT
+	const auto& wrappers = dart::StubCode::WriteBarrierWrappers();
+	const auto& array = dart::StubCode::ArrayWriteBarrier();
+#else
 	auto* store = dart::IsolateGroup::Current()->object_store();
 	const auto& wrappers = dart::Code::Handle(store->write_barrier_wrappers_stub());
+	const auto& array = dart::Code::Handle(store->array_write_barrier_stub());
+#endif
 	const auto wrapper = wrappers.EntryPoint() - app.base() + dart::Thread::WriteBarrierWrappersOffsetForRegister(reg);
 	if (target.imm == wrapper)
 		return BarrierKind::Object;
-	const auto& array = dart::Code::Handle(store->array_write_barrier_stub());
 	if (object == Reg{dart::kWriteBarrierObjectReg} && target.imm == array.EntryPoint() - app.base())
 		return BarrierKind::Array;
 	return std::nullopt;
@@ -1741,9 +1747,15 @@ std::pair<Reg, DartClass*> FunctionAnalyzer::objectResult(ILInstr& il)
 			// GenerateAllocateTypedDataArrayStub returns the tagged internal
 			// array on both allocation paths, in AllocateTypedDataArrayABI.
 			switch (fn->AsStub()->kind) {
-			case DartStub::AllocateFloat32ArrayStub: case DartStub::AllocateFloat32ArrayVMStub:
+			case DartStub::AllocateFloat32ArrayStub:
+#ifndef DART_SINGLE_SNAPSHOT
+			case DartStub::AllocateFloat32ArrayVMStub:
+#endif
 				return {Reg{dart::AllocateTypedDataArrayABI::kResultReg}, app.FindClass(dart::kTypedDataFloat32ArrayCid)};
-			case DartStub::AllocateFloat64ArrayStub: case DartStub::AllocateFloat64ArrayVMStub:
+			case DartStub::AllocateFloat64ArrayStub:
+#ifndef DART_SINGLE_SNAPSHOT
+			case DartStub::AllocateFloat64ArrayVMStub:
+#endif
 				return {Reg{dart::AllocateTypedDataArrayABI::kResultReg}, app.FindClass(dart::kTypedDataFloat64ArrayCid)};
 			default: break;
 			}
@@ -2486,7 +2498,7 @@ X64ParameterRecovery::Source X64ParameterRecovery::source(
 		return {};
 	if ((function.IsClosure() || (function.IsAsync() && suspendState)) &&
 		address.index == X86_REG_INVALID &&
-		address.disp == AOT_Closure_context_offset - dart::kHeapObjectTag) {
+		address.disp == function.ClosureContextOffset() - dart::kHeapObjectTag) {
 		const auto owner = registers[base];
 		const auto closureSlot = std::max(observedStackTop, data.asmTexts.MaxParamStackOffset());
 		const bool incomingClosure = owner.kind == ParameterValue && owner.value >= 0 &&

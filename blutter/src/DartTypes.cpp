@@ -327,7 +327,7 @@ DartAbstractType* DartTypeDb::FindOrAdd(dart::AbstractTypePtr abTypePtr)
 		return FindOrAdd(dart::FunctionType::RawCast(abTypePtr));
 	}
 	//return nullptr;
-	FATAL("Invalid abstract type");
+	FATAL("Invalid abstract type (cid %d)", static_cast<int>(abTypePtr.GetClassId()));
 }
 
 const DartTypeArguments* DartTypeDb::FindOrAdd(dart::TypeArgumentsPtr typeArgsPtr)
